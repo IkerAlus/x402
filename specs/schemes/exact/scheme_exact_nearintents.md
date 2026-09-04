@@ -4,8 +4,7 @@
 
 The `exact` payment scheme for Near Intents uses the [NEAR Intents 1Click Swap API](https://docs.near-intents.org/integration/distribution-channels/1click-api/about-1click-api) as the settlement backend. This scheme facilitates cross-chain payments where a client pays a specified amount of a source asset on any [supported origin chain](https://docs.near-intents.org/resources/chain-support), and the resource server (merchant) receives an exact amount of a destination asset on any supported destination chain, with the NEAR Intents solver network executing the cross-chain swap in between.
 
-
-The asset transfer method is `near-intents` and it MUST use the `upfront` payment flow (`extra.paymentFlow: "upfront"`): the payment is confirmed before the resource executes, and the facilitator's `/verify` endpoint is not invoked. A resource server advertises one `accepts[]` entry per origin network it accepts from
+The asset transfer method is `near-intents`. It belongs to the **client-submitted (payment proof)** family defined in [`scheme_exact.md`](./scheme_exact.md) and satisfies its requirements. It MUST use the `upfront` payment flow (`extra.paymentFlow: "upfront"`): the payment is confirmed before the resource executes, and the facilitator's `/verify` endpoint is not invoked. A resource server advertises one `accepts[]` entry per origin network it accepts from. The merchant configures only its destination recipient; refunds are returned to the client (see [Refunds](#refunds)).
 
 ---
 
@@ -61,7 +60,7 @@ The asset transfer method is `near-intents` and it MUST use the `upfront` paymen
     │                      │                           │   /v0/status         │
     │                      │                           │─────────────────────>│
     │                      │                           │  SUCCESS, or refund  │
-    │                      │                           │  to merchant         │
+    │                      │                           │  to sender           │
     │                      │                           │<─────────────────────│
     │                      │                           │                      │
     │                      │  SettlementResponse       │                      │
@@ -85,7 +84,7 @@ The asset transfer method is `near-intents` and it MUST use the `upfront` paymen
 6. **Client → Resource Server**: retries with `PAYMENT-SIGNATURE` carrying the deposit `txHash`.
 7. **Resource Server → Facilitator `/settle`**: called directly and before the route handler; verification runs inside settle. See [Settlement](#settlement-post-settle).
 8. **Facilitator → 1Click API**: `POST /v0/deposit/submit` to accelerate detection (optional).
-9. **Facilitator polls `GET /v0/status`** until the funds reach the merchant — as swap output (`SUCCESS`) or as a refund to the merchant's `refundTo` — or a terminal failure.
+9. **Facilitator polls `GET /v0/status`** until a terminal outcome: `SUCCESS` (destination asset delivered to the merchant), or a refund (payment failed; funds returned to the deposit sender).
 10. **Resource Server** executes the route handler only after a successful `SettlementResponse`.
 11. **Resource Server → Client**: `200 OK` with the resource and `PAYMENT-RESPONSE`.
 
@@ -103,8 +102,7 @@ The asset transfer method is `near-intents` and it MUST use the `upfront` paymen
   "maxTimeoutSeconds": 280,                // remaining validity of the deposit address
   "extra": {
     "assetTransferMethod": "near-intents",
-    "paymentFlow": "upfront",
-    "refundTo": "0xMerchantOnArbitrum"     // merchant-controlled, on the origin network
+    "paymentFlow": "upfront"
   }
 }
 ```
@@ -129,8 +127,7 @@ Full `PaymentRequired` object:
       "maxTimeoutSeconds": 280,
       "extra": {
         "assetTransferMethod": "near-intents",
-        "paymentFlow": "upfront",
-        "refundTo": "0xMerchantOnArbitrum"
+        "paymentFlow": "upfront"
       }
     }
   ]
@@ -156,7 +153,6 @@ The destination leg (merchant network, asset, recipient, and amount) is fixed in
 |---|---|---|---|
 | `assetTransferMethod` | string | Yes | Always `"near-intents"`. |
 | `paymentFlow` | string | Yes | Always `"upfront"`. |
-| `refundTo` | string | Yes | Origin-network address receiving refunds. Merchant-controlled. See [`refundTo` Configuration](#refundto-configuration). |
 | `depositMemo` | string | Conditional | Present only when the origin network requires a memo or destination tag (e.g., Stellar, XRP, TON). Part of the instrument. |
 
 ---
@@ -184,8 +180,7 @@ Full `PaymentPayload` object:
     "maxTimeoutSeconds": 280,
     "extra": {
       "assetTransferMethod": "near-intents",
-      "paymentFlow": "upfront",
-      "refundTo": "0xMerchantOnArbitrum"
+      "paymentFlow": "upfront"
     }
   },
   "payload": {
@@ -222,7 +217,8 @@ The facilitator obtains deposit addresses from the 1Click API.
      "depositType": "ORIGIN_CHAIN",
      "recipientType": "DESTINATION_CHAIN",
      "recipient": "<merchant wallet>",
-     "refundTo": "<merchant refund address on the origin network>",
+     "refundTo": "<facilitator refund account on NEAR Intents>",
+     "refundType": "INTENTS",
      "deadline": "<now + configured TTL>",
      "referral": "<x402-near-intents>",
      "appFees": [...]
@@ -242,11 +238,8 @@ The checks below run inside `/settle`, before the resource executes.
 2. **Instrument**: `accepted.payTo` is a deposit address this facilitator issued, and its deadline has not passed.
 3. **Claim**: claim `<network>:<txHash>` as in-flight. Concurrent presentations of the same proof MUST result in exactly one claim.
 4. **Deposit**: `txHash` is confirmed on `accepted.network` and transfers at least `accepted.amount` of `accepted.asset` to `accepted.payTo` (with `depositMemo` where required). Confirm via `GET /v0/status` for the deposit address or via the origin network.
-5. **Outcome**: notify the backend (`POST /v0/deposit/submit`), then poll `GET /v0/status?depositAddress=<addr>[&depositMemo=<memo>]`. The proof is **valid** when the funds reached the merchant, by either path:
-   - **Swap path**: status `SUCCESS` with `txHash` among the deposits attributed to the quote. The merchant received the destination asset.
-   - **Refund path**: the deposit was refunded to `accepted.extra.refundTo`. The merchant received the origin asset.
-   Validity does not depend on which path occurred or on the order in which concurrent deposits arrived.
-6. **Consume and respond**: consume the proof and return the `SettlementResponse`. On a terminal outcome where the funds did not reach the merchant, consume the proof and return failure.
+5. **Outcome**: notify the backend (`POST /v0/deposit/submit`), then poll `GET /v0/status?depositAddress=<addr>[&depositMemo=<memo>]`. The proof is **valid** only when status is `SUCCESS` and `txHash` is among the deposits attributed to the quote: the merchant received the destination asset. Any refund is a failure (see [Refunds](#refunds)).
+6. **Consume and respond**: consume the proof and return the `SettlementResponse`. On a refund or other terminal failure, consume the proof and return failure. A quote serves at most one proof.
 
 **Not yet final:** If no terminal outcome is observable within the facilitator's settlement window, it MUST NOT consume the proof, MUST release the in-flight claim, and MUST return `exact_near_intents_not_final`. The client MAY retry with the same proof while the deadline holds. An abnormally terminated attempt MUST NOT leave a proof claimed.
 
@@ -257,12 +250,11 @@ The checks below run inside `/settle`, before the resource executes.
 {
   "success": true,
   "network": "eip155:42161",
-  "transaction": "<destination-network tx hash, or refund tx hash on the refund path>",
+  "transaction": "<destination-network tx hash>",
   "payer": "<deposit sender>",
   "extensions": {
     "depositAddress": "<accepted.payTo>",
-    "originTxHash": "<payload.txHash>",
-    "path": "near-intents"
+    "originTxHash": "<payload.txHash>"
   }
 }
 ```
@@ -275,7 +267,8 @@ The checks below run inside `/settle`, before the resource executes.
   "error": "<error_code>",
   "extensions": {
     "depositAddress": "<accepted.payTo>",
-    "status": "<1Click status>"
+    "status": "<1Click status>",
+    "refundTxHash": "<forwarding tx to the sender, where known>"
   }
 }
 ```
@@ -293,6 +286,7 @@ Keyed by `depositAddress`:
 | `accepts[]` entry | Quote time | As served |
 | rotation flag | First deposit detected | Whether the quote is still served |
 | in-flight / consumed keys | Settle time | `<network>:<txHash>` lifecycle |
+| refund forwarding | Refund observed | Sender account and forwarding transaction |
 
 Retained until `deadline` plus the settlement window.
 
@@ -308,16 +302,25 @@ Retained until `deadline` plus the settlement window.
 
 ### Deposit Address Validity Window
 
-- The client MUST deposit before `maxTimeoutSeconds` elapses. A deposit after the quote deadline is refunded to `refundTo`.
+- The client MUST deposit before `maxTimeoutSeconds` elapses. A deposit after the quote deadline is refunded to the sender.
 - `maxTimeoutSeconds` SHOULD be calibrated per origin network (minutes for EVM and Solana origins, substantially longer for Bitcoin).
 
 ### Amount Validation
 
-Acceptance follows `exact`: the client sends `amount`. A deposit below `amount` is refunded to `refundTo` and the proof is invalid. A deposit above `amount` is swap input, the excess is refunded to `refundTo`.
+Acceptance follows `exact`: the client sends `amount`. A deposit below `amount` is refunded to the sender and the proof is invalid. A deposit above `amount` is swap input, the excess is refunded to the sender.
+
+### Refunds
+
+A refund is always a failed payment: the client is not served and is made whole.
+
+- At quote time the facilitator sets `refundTo` to a facilitator-controlled account on NEAR Intents (`refundType: INTENTS`), so refunds from every origin network are collected in one place. Merchants configure nothing on origin networks.
+- On any refund (swap failure, insufficient or late deposit, excess, or a second deposit to a shared address) the facilitator MUST forward the refunded amount to the origin-network account that funded the deposit: the transaction sender on account-based networks, the first input address on UTXO networks. The sender is established by the chain, not by the presenter of the proof.
+- Forwarding does not require the client to present the proof. The facilitator holds refunds only transiently; unforwarded amounts are held per facilitator policy.
+- Clients MUST pay from an account they control. A deposit sent from a custodial or exchange wallet is refunded to that wallet and MUST be recovered through it.
 
 ### Concurrent Deposits
 
-Because the deposit address does not depend on the client, two clients may fund a shared address. The merchant receives value for both: one as swap output, one as a refund to `refundTo`. Both proofs are valid under the funds-reached-merchant rule. Facilitators MUST rotate on first deposit detection to keep this path rare. Merchants that cannot accept origin-asset receipts SHOULD require per-402 quotes.
+Because the deposit address does not depend on the client, two clients may fund a shared address. One deposit becomes swap input and that client is served; the other is refunded to its sender and that client is not served. Where the backend aggregates both deposits into one swap, the facilitator serves the first proof claimed and forwards the other deposit's amount to its sender. Facilitators MUST rotate on first deposit detection to keep this rare.
 
 ### Deposit Address Authenticity
 
@@ -333,10 +336,10 @@ Because the deposit address does not depend on the client, two clients may fund 
 |---|---|
 | `invalid_exact_near_intents_instrument` | `payTo` is not a deposit address issued by this facilitator, or its deadline passed. |
 | `invalid_exact_near_intents_deposit_not_found` | `txHash` not observed as a deposit to `payTo`. |
-| `invalid_exact_near_intents_insufficient_deposit` | Deposit below `amount`. |
+| `invalid_exact_near_intents_insufficient_deposit` | Deposit below `amount`; refunded to the sender. |
 | `invalid_exact_near_intents_proof_reused` | Consumption key already in-flight or consumed. |
 | `exact_near_intents_not_final` | No terminal outcome yet; retry with the same proof. |
-| `exact_near_intents_settlement_failed` | Terminal outcome; funds did not reach the merchant. |
+| `exact_near_intents_settlement_failed` | Swap did not complete; deposit refunded to the sender. |
 
 ---
 
@@ -363,10 +366,10 @@ Because the deposit address does not depend on the client, two clients may fund 
 
 | Relationship | Trust Required | Comparable To |
 |---|---|---|
-| Client → deposit address | The backend delivers to the merchant or refunds to `refundTo` | Paying a payment processor |
+| Client → deposit address | The backend delivers to the merchant or refunds to the facilitator, which forwards to the sender | Paying a payment processor |
 | Resource server → Facilitator | Standard x402 trust model | Other `exact` methods |
 
-Settlement is not trustless: between deposit and delivery the funds are custodied by the settlement backend, which enforces the deposit-address-to-recipient binding. Clients and agent policies can identify this from `assetTransferMethod`.
+Settlement is not trustless: between deposit and delivery the funds are custodied by the settlement backend, which enforces the deposit-address-to-recipient binding, and refunds are held transiently by the facilitator before forwarding. Clients and agent policies can identify this from `assetTransferMethod`.
 
 ### Multi-Origin-Chain Support
 
@@ -375,13 +378,9 @@ One `accepts[]` entry per offered origin, each on its own `network` with its own
 ```jsonc
 "accepts": [
   { "scheme": "exact", "network": "eip155:8453",  "asset": "0x8335…", "amount": "1000000", "payTo": "0xMerchantOnBase", "maxTimeoutSeconds": 60,  "extra": { "assetTransferMethod": "eip3009" } },
-  { "scheme": "exact", "network": "eip155:42161", "asset": "0xaf88…", "amount": "1005000", "payTo": "0x76b4…",          "maxTimeoutSeconds": 280, "extra": { "assetTransferMethod": "near-intents", "paymentFlow": "upfront", "refundTo": "0xMerchantOnArbitrum" } },
-  { "scheme": "exact", "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", "asset": "EPjF…", "amount": "1006000", "payTo": "9xQe…", "maxTimeoutSeconds": 280, "extra": { "assetTransferMethod": "near-intents", "paymentFlow": "upfront", "refundTo": "MerchantOnSolana…" } }
+  { "scheme": "exact", "network": "eip155:42161", "asset": "0xaf88…", "amount": "1005000", "payTo": "0x76b4…",          "maxTimeoutSeconds": 280, "extra": { "assetTransferMethod": "near-intents", "paymentFlow": "upfront" } },
+  { "scheme": "exact", "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", "asset": "EPjF…", "amount": "1006000", "payTo": "9xQe…", "maxTimeoutSeconds": 280, "extra": { "assetTransferMethod": "near-intents", "paymentFlow": "upfront" } }
 ]
 ```
 
 In practice a merchant offers a limited, curated set of origins.
-
-### `refundTo` Configuration
-
-`refundTo` is merchant-controlled: the facilitator cannot know the payer before payment. Every deposit that does not become swap input (excess, a second concurrent deposit, a failed swap, a late or insufficient deposit) is refunded there in the origin asset. A sufficient deposit therefore always results in the merchant being paid, and the client being served, in one asset or the other. An insufficient or late deposit is refunded to the merchant and the client is not served. Recovery is off-band under the merchant's terms. Merchants accept origin-asset receipts by configuring `refundTo` and need a refund address on each origin network they offer.
