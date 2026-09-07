@@ -12,7 +12,7 @@ It complements cross-chain asset transfer methods in the client-submitted (payme
 
 ## Wire Format
 
-Server → client, in the `extensions` object of the `PaymentRequired` response.
+Server → client, in the `extensions` object of the `PaymentRequired` response. Per section 5.1 of the core specification the entry carries `info` and a `schema` describing it.
 
 ```jsonc
 {
@@ -31,6 +31,37 @@ Server → client, in the `extensions` object of the `PaymentRequired` response.
           { "network": "bip122:000000000019d6689c085ae165831e93", "asset": "BTC", "indicativeAmount": "1520", "timeEstimate": 1800 }
         ],
         "expires": "2026-09-04T15:10:00Z"
+      },
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["destination", "origins"],
+        "properties": {
+          "provider": { "type": "string" },
+          "destination": {
+            "type": "object",
+            "required": ["network", "asset", "amount"],
+            "properties": {
+              "network": { "type": "string" },
+              "asset": { "type": "string" },
+              "amount": { "type": "string", "pattern": "^[0-9]+$" }
+            }
+          },
+          "origins": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["network", "asset"],
+              "properties": {
+                "network": { "type": "string" },
+                "asset": { "type": "string" },
+                "indicativeAmount": { "type": "string", "pattern": "^[0-9]+$" },
+                "timeEstimate": { "type": "integer", "minimum": 0 }
+              }
+            }
+          },
+          "expires": { "type": "string", "format": "date-time" }
+        }
       }
     }
   }
@@ -39,6 +70,7 @@ Server → client, in the `extensions` object of the `PaymentRequired` response.
 
 | Field | Presence | Description |
 | --- | --- | --- |
+| `schema` | REQUIRED | JSON Schema for `info`, as above. |
 | `info.provider` | OPTIONAL | Settlement provider identifier. Free-form. |
 | `info.destination.network` | REQUIRED | CAIP-2 of the network the merchant receives on. |
 | `info.destination.asset` | REQUIRED | Asset the merchant receives. |

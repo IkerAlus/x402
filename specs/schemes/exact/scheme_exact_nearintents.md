@@ -78,7 +78,7 @@ The asset transfer method is `near-intents`. It belongs to the **client-submitte
 
 1. **Client → Resource Server**: `GET /resource` without payment headers.
 2. **Resource Server → Facilitator**: the middleware requests `PaymentRequirements` for each origin network the merchant offers.
-3. **Facilitator → 1Click API**: `POST /v0/quote` with `dry: false` and `swapType: EXACT_OUTPUT`, or a cached, unexpired, unfunded quote for that (resource, origin). The quote yields a single-use `depositAddress`, the required input amount, and a `deadline`. See [Quote Generation](#quote-generation-402-construction-time).
+3. **Facilitator → 1Click API**: `POST /v0/quote` with `dry: false` and `swapType: EXACT_OUTPUT`, or a cached, unexpired, unfunded quote for that (resource, origin). The quote yields a single-use `depositAddress`, `amountIn` (the required input, including the slippage buffer), `minAmountIn` (the minimum the backend will execute), and a `deadline`. See [Quote Generation](#quote-generation-402-construction-time).
 4. **Resource Server → Client**: `402 Payment Required`. Each entry has `network` = origin network and `payTo` = the deposit address.
 5. **Client sends deposit**: a native transfer of `amount` of `asset` to `payTo` on `network` (with `extra.depositMemo` where required), before `maxTimeoutSeconds` elapses.
 6. **Client → Resource Server**: retries with `PAYMENT-SIGNATURE` carrying the deposit `txHash`.
@@ -142,10 +142,10 @@ The destination leg (merchant network, asset, recipient, and amount) is fixed in
 |---|---|---|
 | `scheme` | — | Always `"exact"`. |
 | `network` | Request `originAsset` chain | CAIP-2 of the **origin** network: where the client pays and where the proof is anchored. |
-| `amount` | `quote.maxAmountIn` | The deposit amount the client MUST send, in base units of `asset`. |
+| `amount` | `quote.amountIn` | The deposit amount the client MUST send, in base units of `asset`. Includes the backend's slippage buffer; see [Amount Validation](#amount-validation). |
 | `asset` | Request `originAsset` | The origin asset, in the identifier used by that network's own x402 scheme. Otherwise it is the network's canonical identifier. |
 | `payTo` | `quote.depositAddress` | The single-use deposit address. The payment instrument. |
-| `maxTimeoutSeconds` | `deadline` − now | Remaining validity of the deposit address at issuance. |
+| `maxTimeoutSeconds` | `deadline` − now − margin | Remaining validity of the deposit address at issuance. The client MUST deposit before it elapses. |
 
 ### Extra Field Descriptions
 
@@ -224,7 +224,7 @@ The facilitator obtains deposit addresses from the 1Click API.
      "appFees": [...]
    }
    ```
-2. Build the `accepts[]` entry: `network` = origin, `payTo` = `quote.depositAddress`, `amount` = `quote.maxAmountIn`, `maxTimeoutSeconds` = remaining validity.
+2. Build the `accepts[]` entry: `network` = origin, `payTo` = `quote.depositAddress`, `amount` = `quote.amountIn`, `maxTimeoutSeconds` = remaining validity. Retain `quote.minAmountIn` in facilitator state.
 
 The facilitator resolves (`network`, `asset`) to the 1Click `assetId` via `GET /v0/tokens` endpoint.
 
@@ -237,39 +237,53 @@ The checks below run inside `/settle`, before the resource executes.
 1. **Structural**: `accepted.extra.assetTransferMethod` is `near-intents`; `payload.txHash` is well-formed for `accepted.network`.
 2. **Instrument**: `accepted.payTo` is a deposit address this facilitator issued, and its deadline has not passed.
 3. **Claim**: claim `<network>:<txHash>` as in-flight. Concurrent presentations of the same proof MUST result in exactly one claim.
-4. **Deposit**: `txHash` is confirmed on `accepted.network` and transfers at least `accepted.amount` of `accepted.asset` to `accepted.payTo` (with `depositMemo` where required). Confirm via `GET /v0/status` for the deposit address or via the origin network.
-5. **Outcome**: notify the backend (`POST /v0/deposit/submit`), then poll `GET /v0/status?depositAddress=<addr>[&depositMemo=<memo>]`. The proof is **valid** only when status is `SUCCESS` and `txHash` is among the deposits attributed to the quote: the merchant received the destination asset. Any refund is a failure (see [Refunds](#refunds)).
+4. **Deposit**: `txHash` is confirmed on `accepted.network` and transfers at least the quote's `minAmountIn` of `accepted.asset` to `accepted.payTo` (with `depositMemo` where required). Confirm via `GET /v0/status` for the deposit address or via the origin network. The floor is `minAmountIn`, not `accepted.amount`: the backend executes any deposit at or above it.
+5. **Outcome**: notify the backend (`POST /v0/deposit/submit`), then poll `GET /v0/status?depositAddress=<addr>[&depositMemo=<memo>]`. Statuses `KNOWN_DEPOSIT_TX`, `PENDING_DEPOSIT` and `PROCESSING` are non-terminal; `SUCCESS`, `REFUNDED`, `FAILED` and `INCOMPLETE_DEPOSIT` are terminal. The proof is **valid** only when status is `SUCCESS` and `txHash` is among `swapDetails.originChainTxHashes`: the merchant received the destination asset. Any refund is a failure (see [Refunds](#refunds)).
 6. **Consume and respond**: consume the proof and return the `SettlementResponse`. On a refund or other terminal failure, consume the proof and return failure. A quote serves at most one proof.
 
-**Not yet final:** If no terminal outcome is observable within the facilitator's settlement window, it MUST NOT consume the proof, MUST release the in-flight claim, and MUST return `exact_near_intents_not_final`. The client MAY retry with the same proof while the deadline holds. An abnormally terminated attempt MUST NOT leave a proof claimed.
+**Not yet final:** If no terminal outcome is observable within the facilitator's settlement window, it MUST NOT consume the proof, MUST release the in-flight claim, and MUST return `success: false` with `errorReason: "settlement_pending"`, `transaction` = the deposit `txHash` and `network` = `accepted.network`, per section 9 of the core specification. The client MAY retry with the same proof while the deadline holds. An abnormally terminated attempt MUST NOT leave a proof claimed.
 
 **Finality** is delivery to the merchant. A facilitator MUST NOT advance settlement on its own origin-network observation.
 
-**On success:**
+**On success** — `network` and `transaction` identify the delivery to the merchant on the destination network; the client's deposit is reported in `extensions`:
 ```jsonc
 {
   "success": true,
-  "network": "eip155:42161",
-  "transaction": "<destination-network tx hash>",
+  "network": "eip155:8453",
+  "transaction": "<destination-network delivery tx hash>",
   "payer": "<deposit sender>",
+  "amount": "<amountOut>",
   "extensions": {
     "depositAddress": "<accepted.payTo>",
+    "originNetwork": "eip155:42161",
     "originTxHash": "<payload.txHash>"
   }
 }
 ```
 
-**On failure:**
+**On failure** — `transaction` is the refund forwarding transaction to the sender on the origin network, or `""` if none has been broadcast:
 ```jsonc
 {
   "success": false,
+  "errorReason": "<error_code>",
   "network": "eip155:42161",
-  "error": "<error_code>",
+  "transaction": "<refund forwarding tx hash, or empty string>",
+  "payer": "<deposit sender>",
   "extensions": {
     "depositAddress": "<accepted.payTo>",
-    "status": "<1Click status>",
-    "refundTxHash": "<forwarding tx to the sender, where known>"
+    "status": "<1Click status>"
   }
+}
+```
+
+**Not yet final** — non-terminal; the client retries with the same proof:
+```jsonc
+{
+  "success": false,
+  "errorReason": "settlement_pending",
+  "network": "eip155:42161",
+  "transaction": "<payload.txHash>",
+  "extensions": { "depositAddress": "<accepted.payTo>", "status": "PROCESSING" }
 }
 ```
 
@@ -302,19 +316,19 @@ Retained until `deadline` plus the settlement window.
 
 ### Deposit Address Validity Window
 
-- The client MUST deposit before `maxTimeoutSeconds` elapses. A deposit after the quote deadline is refunded to the sender.
+- The client MUST deposit before `maxTimeoutSeconds` elapses. The backend documents the quote `deadline` as the point after which the deposit address becomes inactive and funds may be lost; a deposit arriving after it is not guaranteed to be refunded. Facilitators SHOULD derive `maxTimeoutSeconds` from `deadline` with a safety margin.
 - `maxTimeoutSeconds` SHOULD be calibrated per origin network (minutes for EVM and Solana origins, substantially longer for Bitcoin).
 
 ### Amount Validation
 
-Acceptance follows `exact`: the client sends `amount`. A deposit below `amount` is refunded to the sender and the proof is invalid. A deposit above `amount` is swap input, the excess is refunded to the sender.
+The client sends `amount` (`quote.amountIn`), which includes the backend's slippage buffer. Sufficiency is determined by the backend: a deposit of at least `quote.minAmountIn` is executed, and any input above what the swap consumes is refunded to the sender; a deposit below `minAmountIn` is refunded in full (`INCOMPLETE_DEPOSIT`) and the proof is invalid. The merchant receives exactly `amountOut` in every executed case.
 
 ### Refunds
 
-A refund is always a failed payment: the client is not served and is made whole.
+A refund is always a failed payment: the client is not served, and the deposited amount is returned net of the backend's `refundFee` and forwarding costs.
 
 - At quote time the facilitator sets `refundTo` to a facilitator-controlled account on NEAR Intents (`refundType: INTENTS`), so refunds from every origin network are collected in one place. Merchants configure nothing on origin networks.
-- On any refund (swap failure, insufficient or late deposit, excess, or a second deposit to a shared address) the facilitator MUST forward the refunded amount to the origin-network account that funded the deposit: the transaction sender on account-based networks, the first input address on UTXO networks. The sender is established by the chain, not by the presenter of the proof.
+- On any refund (swap failure, insufficient deposit, excess, or a second deposit to a shared address) the facilitator MUST forward the refunded amount to the origin-network account that funded the deposit: the transaction sender on account-based networks, the first input address on UTXO networks. The sender is established by the chain, not by the presenter of the proof. `GET /v0/status` does not expose the sender; the facilitator MUST read the deposit transaction on the origin network to determine it.
 - Forwarding does not require the client to present the proof. The facilitator holds refunds only transiently; unforwarded amounts are held per facilitator policy.
 - Clients MUST pay from an account they control. A deposit sent from a custodial or exchange wallet is refunded to that wallet and MUST be recovered through it.
 
@@ -324,7 +338,7 @@ Because the deposit address does not depend on the client, two clients may fund 
 
 ### Deposit Address Authenticity
 
-- The facilitator MUST only serve deposit addresses obtained from authenticated 1Click calls.
+- The facilitator MUST only serve deposit addresses obtained from authenticated 1Click calls, and SHOULD verify and retain the quote `signature` returned with each quote.
 - No interdiction point exists after a deposit lands, any screening MUST occur before the 402 is issued.
 - Clients paying first bear the risk of a malicious resource server, as with any payment gateway.
 
@@ -332,13 +346,14 @@ Because the deposit address does not depend on the client, two clients may fund 
 
 ## Error Codes
 
+Not-yet-final settlements use the core `settlement_pending` error reason (section 9). Scheme-specific codes:
+
 | Code | Description |
 |---|---|
 | `invalid_exact_near_intents_instrument` | `payTo` is not a deposit address issued by this facilitator, or its deadline passed. |
 | `invalid_exact_near_intents_deposit_not_found` | `txHash` not observed as a deposit to `payTo`. |
-| `invalid_exact_near_intents_insufficient_deposit` | Deposit below `amount`; refunded to the sender. |
+| `invalid_exact_near_intents_insufficient_deposit` | Deposit below the quote's `minAmountIn`; refunded to the sender. |
 | `invalid_exact_near_intents_proof_reused` | Consumption key already in-flight or consumed. |
-| `exact_near_intents_not_final` | No terminal outcome yet; retry with the same proof. |
 | `exact_near_intents_settlement_failed` | Swap did not complete; deposit refunded to the sender. |
 
 ---
