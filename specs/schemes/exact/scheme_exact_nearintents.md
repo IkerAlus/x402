@@ -61,6 +61,7 @@ The asset transfer method is `near-intents`. It belongs to the **client-submitte
     │  PAYMENT-SIGNATURE:  │                           │                       │
     │  {type: deposit,     │                           │                       │
     │   operationToken,    │                           │                       │
+    │   depositAddress,    │                           │                       │
     │   txHash}            │                           │                       │
     │─────────────────────>│                           │                       │
     │                      │                           │                       │
@@ -98,8 +99,8 @@ The asset transfer method is `near-intents`. It belongs to the **client-submitte
 4. **Resource Server → Facilitator `/verify`**: the facilitator mints the quote. See [Quote](#quote-verify).
 5. **Facilitator → 1Click API**: one `POST /v0/quote` (`dry: false`, `swapType: EXACT_OUTPUT`). It yields a single-use `depositAddress`, `amountIn` and `minAmountIn`.
 6. **Resource Server → Client**: a second `402` with the quoted entry in `PAYMENT-REQUIRED`. A `quote` payload never unlocks the resource.
-7. **Client deposits**: a transfer of `amount` of `asset` to `payTo` on `network` (with `extra.depositMemo` where required), before `maxTimeoutSeconds` elapses.
-8. **Client → Resource Server**: retries with `PAYMENT-SIGNATURE` carrying a `deposit` payload with `operationToken` and the deposit `txHash`.
+7. **Client deposits**: a transfer of `amount` of `asset` to `payTo` on `network` (with `extra.depositMemo` where required), early enough to confirm before `extra.refundDeadline`.
+8. **Client → Resource Server**: retries with `PAYMENT-SIGNATURE` carrying a `deposit` payload with `operationToken`, the deposit instrument and the deposit `txHash`.
 9. **Resource Server → Facilitator `/settle`**: called before the route handler. See [Settlement](#settlement-settle).
 10. **Facilitator → 1Click API**: `POST /v0/deposit/submit` to accelerate detection (optional).
 11. **Facilitator polls `GET /v0/status`** until the merchant is paid (`SUCCESS`) or the payment has failed.
@@ -126,13 +127,14 @@ First `PaymentRequired`:
     {
       "scheme": "exact",
       "network": "eip155:42161",               // ORIGIN network: where the client pays
-      "amount": "1005000",                     // indicative, not binding
+      "amount": "",                            // vacant until quoted
       "asset": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", // origin asset (USDC on Arbitrum)
-      "payTo": "quote",                        // role constant: not quoted yet
+      "payTo": "",                             // vacant until quoted
       "maxTimeoutSeconds": 300,                // deposit window to request
       "extra": {
         "assetTransferMethod": "near-intents",
         "paymentFlow": "upfront",
+        "indicativeAmount": "1005000",         // e.g. from a cached dry quote; not binding
         "destination": {
           "network": "eip155:8453",
           "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC on Base
@@ -146,7 +148,7 @@ First `PaymentRequired`:
 }
 ```
 
-Second `PaymentRequired`: the same `resource`, and only the quoted entry:
+Second `PaymentRequired`: the same `resource`, with the quoted entry in place of its unquoted entry. Other entries MAY remain; clients identify the quoted entry by `extra.operationToken`:
 
 ```jsonc
 {
@@ -155,11 +157,13 @@ Second `PaymentRequired`: the same `resource`, and only the quoted entry:
   "amount": "1005000",                     // quote.amountIn: the amount to deposit
   "asset": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
   "payTo": "0x76b4c56085ED136a8744D52bE956396624a730E8", // 1Click deposit address
-  "maxTimeoutSeconds": 280,                // time left to deposit
+  "maxTimeoutSeconds": 300,                // unchanged
   "extra": {
     "assetTransferMethod": "near-intents",
     "paymentFlow": "upfront",
+    "indicativeAmount": "1005000",         // unchanged
     "destination": { /* unchanged */ },
+    "refundDeadline": "2026-09-23T10:10:00Z", // deposit cutoff, see Timing
     "operationToken": "k1.1790244600.Da1hrEbt50TdIbfZb5EhYU9CnB120jf-cs0d189lrvQ"
   }
 }
@@ -171,10 +175,10 @@ Second `PaymentRequired`: the same `resource`, and only the quoted entry:
 |---|---|---|
 | `scheme` | Always `"exact"`. | Always `"exact"`. |
 | `network` | CAIP-2 of the **origin** network: where the client pays and where the proof is anchored. | Unchanged. |
-| `amount` | Indicative amount, e.g., from a cached `dry: true` quote. Not binding. | `quote.amountIn`: the amount the client MUST deposit, in base units of `asset`. Includes the slippage buffer and fees. |
+| `amount` | Vacant (`""`): the entry cannot be paid yet. The indicative amount is `extra.indicativeAmount`. | `quote.amountIn`: the amount the client MUST deposit, in base units of `asset`. Includes the slippage buffer and fees. |
 | `asset` | The origin asset, in the identifier used by that network's own x402 scheme. Otherwise it is the network's canonical identifier. | Unchanged. |
-| `payTo` | The role constant `"quote"`: the entry cannot be paid yet. | `quote.depositAddress`: the single-use deposit address. With `network` and `depositMemo`, the payment instrument. |
-| `maxTimeoutSeconds` | Deposit window the facilitator requests from 1Click. | Time left to deposit. See [Timing](#timing). |
+| `payTo` | Vacant (`""`): the entry cannot be paid yet. | `quote.depositAddress`: the single-use deposit address. With `network` and `depositMemo`, the payment instrument. |
+| `maxTimeoutSeconds` | Deposit window the facilitator requests from 1Click. | Unchanged. The deposit cutoff is `extra.refundDeadline`. See [Timing](#timing). |
 
 ### Extra Field Descriptions
 
@@ -186,7 +190,9 @@ Second `PaymentRequired`: the same `resource`, and only the quoted entry:
 | `destination.asset` | string | Yes | Asset the merchant receives, in the identifier used by that network's own x402 scheme. |
 | `destination.amount` | string | Yes | Exact amount the merchant receives, in base units. |
 | `destination.recipient` | string | Yes | Merchant address on `destination.network`. |
+| `indicativeAmount` | string | Unquoted entry | Indicative amount of `asset` to deposit, e.g., from a cached `dry: true` quote. Not binding. MAY remain in the quoted entry. |
 | `operationToken` | string | Quoted entry | Issued by the facilitator. Authorizes redemption of this quote. See [Operation Token](#operation-token). |
+| `refundDeadline` | string | Quoted entry | ISO 8601 time. The refund deadline the facilitator sent in the quote request: a deposit not swapped by then is refunded. See [Timing](#timing). |
 | `depositMemo` | string | Conditional | Quoted entry only, when the origin network requires a memo or destination tag (e.g., Stellar, XRP, TON). Part of the instrument. |
 
 Clients MUST skip `accepts[]` entries whose `assetTransferMethod` they do not implement, as the core specification requires for an unrecognized `paymentFlow` (section 6.1).
@@ -222,16 +228,18 @@ The payload has two types, set in `payload.type`. Both payloads MUST carry `reso
 
 ### Deposit payload
 
-`accepted` is the quoted entry.
+`accepted` is the unquoted entry, as advertised in the first 402. The instrument the client paid is carried in the payload.
 
 ```jsonc
 {
   "x402Version": 2,
   "resource": { "url": "https://api.example.com/premium-data" },
-  "accepted": { /* quoted entry */ },
+  "accepted": { /* unquoted entry */ },
   "payload": {
     "type": "deposit",
     "operationToken": "k1.1790244600.Da1hrEbt50TdIbfZb5EhYU9CnB120jf-cs0d189lrvQ",
+    "depositAddress": "0x76b4c56085ED136a8744D52bE956396624a730E8",
+    // + depositMemo where the origin network requires one
     "txHash": "0x9bcff372aee89b648c922b850573b22387c31d693079f5e37cd255814e2d615a"
   }
 }
@@ -241,6 +249,8 @@ The payload has two types, set in `payload.type`. Both payloads MUST carry `reso
 |---|---|---|---|
 | `payload.type` | string | Yes | Always `"deposit"`. |
 | `payload.operationToken` | string | Yes | The token from the quoted entry. Proves the presenter received this quote. |
+| `payload.depositAddress` | string | Yes | The quoted entry's `payTo`. |
+| `payload.depositMemo` | string | Conditional | The quoted entry's `extra.depositMemo`, where present. |
 | `payload.txHash` | string | Yes | The client's deposit transaction on `accepted.network`. The payment proof. |
 
 The proof is observation-dependent: validation requires observing the origin network or the backend.
@@ -251,7 +261,8 @@ The proof is observation-dependent: validation requires observing the origin net
 
 - Reject a payload whose `resource.url` is not the resource advertised for this request.
 - Call `/verify` and `/settle` with `paymentRequirements` set to the server's own unquoted entry for `accepted.network` and `accepted.asset`, never with `accepted`. Destination terms MUST come from the server's own configuration.
-- On a `quote` payload, call `/verify`. On `isValid: true`, return a second 402 with the quoted entry built from `VerifyResponse.extra`: `depositAddress` becomes `payTo`, `amountIn` becomes `amount`, `refundDeadline` sets `maxTimeoutSeconds` (see [Timing](#timing)), and `operationToken` (plus `depositMemo` where present) goes into `extra`. Do not execute the route handler.
+- `extra.indicativeAmount` MAY change between responses. Do not reject a payload because the echoed value differs from the current one.
+- On a `quote` payload, call `/verify`. On `isValid: true`, return a second 402 with the quoted entry built from `VerifyResponse.extra`: `depositAddress` becomes `payTo`, `amountIn` becomes `amount`, and `refundDeadline` and `operationToken` (plus `depositMemo` where present) go into `extra`. `maxTimeoutSeconds` is unchanged. Do not execute the route handler.
 - On a `deposit` payload, call `/settle` before the route handler. Execute the handler only after `success: true`, once per operation. On `settlement_pending`, return the pending receipt.
 
 ---
@@ -299,7 +310,7 @@ If 1Click returns no quote, the facilitator returns `isValid: false` with `inval
 | `expiry` | Unix time in seconds: the refund deadline plus a grace window of at least 24 hours. |
 | `mac` | Unpadded base64url of `HMAC-SHA256(key, network:depositAddress[:depositMemo]:resource:destinationHash:expiry)`. |
 
-- `network`, `depositAddress` and `depositMemo` are the quoted entry's `network`, `payTo` and `extra.depositMemo`. `resource` is `resource.url`.
+- `network` is the entry's `network`; `depositAddress` and `depositMemo` are the quoted entry's `payTo` and `extra.depositMemo`, which the client echoes in the deposit payload. `resource` is `resource.url`.
 - `destinationHash` is the lowercase hex SHA-256 of `network:asset:amount:recipient`, taken from `paymentRequirements.extra.destination`.
 - The token needs no storage: the facilitator recomputes `mac` at settlement.
 - A facilitator MUST keep a key while any token issued with it is unexpired.
@@ -309,11 +320,11 @@ If 1Click returns no quote, the facilitator returns `isValid: false` with `inval
 
 The rules below run inside `/settle`, before the resource executes. An operation is identified by its `operationToken`.
 
-1. **Structural**: `accepted.extra.assetTransferMethod` is `near-intents`; `payload.type` is `deposit`; `resource.url` is present; `payload.operationToken` equals `accepted.extra.operationToken`; `payload.txHash` is well-formed for `accepted.network`; `accepted.network` and `accepted.asset` equal those of `paymentRequirements`.
-2. **Token**: a token past its `expiry` is rejected with `invalid_exact_near_intents_token_expired`, without any lookup. Otherwise the facilitator recomputes `mac` from `accepted`, `resource.url` and `paymentRequirements.extra.destination`. A mismatch or an unknown `keyId` is rejected with `invalid_exact_near_intents_token_invalid`.
-3. **Quote terms**: read `GET /v0/status?depositAddress=<payTo>[&depositMemo=<memo>]`. The `recipient`, destination asset and `amount` of `quoteResponse.quoteRequest` MUST match `paymentRequirements.extra.destination`, mapped as at quote time; otherwise `invalid_exact_near_intents_quote_mismatch`.
+1. **Structural**: `accepted.extra.assetTransferMethod` is `near-intents`; `payload.type` is `deposit`; `resource.url` is present; `payload.depositAddress` and `payload.txHash` are well-formed for `accepted.network`; `accepted.network` and `accepted.asset` equal those of `paymentRequirements`.
+2. **Token**: a token past its `expiry` is rejected with `invalid_exact_near_intents_token_expired`, without any lookup. Otherwise the facilitator recomputes `mac` from `accepted.network`, `payload.depositAddress`, `payload.depositMemo`, `resource.url` and `paymentRequirements.extra.destination`. A mismatch or an unknown `keyId` is rejected with `invalid_exact_near_intents_token_invalid`.
+3. **Quote terms**: read `GET /v0/status?depositAddress=<payload.depositAddress>[&depositMemo=<payload.depositMemo>]`. The `recipient`, destination asset and `amount` of `quoteResponse.quoteRequest` MUST match `paymentRequirements.extra.destination`, mapped as at quote time; otherwise `invalid_exact_near_intents_quote_mismatch`.
 4. **Claim**: claim `<network>:<txHash>` as in-flight for this operation. Concurrent presentations of the same proof MUST result in exactly one claim; the others receive `settlement_pending`. A proof already consumed by this operation returns the recorded `SettlementResponse`. A proof consumed by a different operation is rejected with `invalid_exact_near_intents_proof_bound`. A claim MUST expire, and a worker whose claim has expired MUST NOT consume.
-5. **Deposit**: `txHash` is a confirmed transaction on `accepted.network` that transfers `accepted.asset` to `accepted.payTo` (with `depositMemo` where required). A transaction confirmed on the origin network that does not pay the instrument MUST be rejected with `invalid_exact_near_intents_deposit_not_found`. A transaction not yet observable is not final: release the claim and return `settlement_pending`. A facilitator MAY reject a transaction still unknown to the origin network after a documented observation window.
+5. **Deposit**: `txHash` is a confirmed transaction on `accepted.network` that transfers `accepted.asset` to `payload.depositAddress` (with `payload.depositMemo` where required). A transaction confirmed on the origin network that does not pay the instrument MUST be rejected with `invalid_exact_near_intents_deposit_not_found`. A transaction not yet observable is not final: release the claim and return `settlement_pending`. A facilitator MAY reject a transaction still unknown to the origin network after a documented observation window.
 6. **Outcome**: notify the backend (`POST /v0/deposit/submit`), then poll `GET /v0/status`. The response carries `status` and `swapDetails`.
    - Statuses `KNOWN_DEPOSIT_TX`, `PENDING_DEPOSIT`, `PROCESSING` and `INCOMPLETE_DEPOSIT` are non-terminal.
    - `SUCCESS`, `REFUNDED` and `FAILED` are terminal.
@@ -406,15 +417,15 @@ The facilitator publishes its permitted range and default in `/supported`, as `k
 ### Timing
 
 - The refund deadline is the `deadline` the facilitator sends in the quote request. 1Click refunds a deposit it has not swapped by then.
-- The quoted `maxTimeoutSeconds` is the refund deadline minus now, minus a margin that covers deposit confirmation on the origin network. The client MUST deposit before it elapses.
-- The `deadline` in 1Click's quote response is a later time, when the deposit address becomes inactive and funds may be lost. It MUST NOT be used for `maxTimeoutSeconds`.
+- The quoted entry carries the refund deadline as `extra.refundDeadline` and keeps `maxTimeoutSeconds` unchanged. The client MUST deposit early enough for the deposit to confirm on the origin network before `refundDeadline`.
+- The `deadline` in 1Click's quote response is a later time, when the deposit address becomes inactive and funds may be lost. It MUST NOT be used for `refundDeadline` or `maxTimeoutSeconds`.
 - `maxTimeoutSeconds` SHOULD be calibrated per origin network (minutes for EVM and Solana origins, substantially longer for Bitcoin).
 - A proof for an executed deposit remains redeemable until the token's `expiry`, at least 24 hours after the refund deadline.
 
 ### Client Obligations
 
-- Check the quoted `amount` before depositing. The unquoted `amount` is indicative only.
-- Persist the quoted entry before depositing and the `txHash` after. Loss of the `operationToken` leaves a delivered payment unredeemable.
+- Check the quoted `amount` before depositing. The unquoted entry carries only `extra.indicativeAmount`, which is not binding.
+- Persist the quoted entry's `payTo`, `extra.depositMemo` and `extra.operationToken` before depositing and the `txHash` after. Loss of the `operationToken` leaves a delivered payment unredeemable.
 - Present the same `operationToken` and `txHash` on every retry. MUST NOT fund a new quote while an operation is pending.
 - Use a `refundTo` you control on the origin network.
 
