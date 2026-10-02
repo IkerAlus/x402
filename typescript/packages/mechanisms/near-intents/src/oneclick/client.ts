@@ -1,27 +1,16 @@
 import { z } from "zod";
+import { ONE_CLICK_BASE_URL } from "../constants";
 
-export const ONE_CLICK_BASE_URL = "https://1click.chaindefuser.com";
 const DEFAULT_TIMEOUT_MS = 30_000;
-
-export const SWAP_STATUSES = [
-  "KNOWN_DEPOSIT_TX",
-  "PENDING_DEPOSIT",
-  "INCOMPLETE_DEPOSIT",
-  "PROCESSING",
-  "SUCCESS",
-  "REFUNDED",
-  "FAILED",
-] as const;
-export type SwapStatus = (typeof SWAP_STATUSES)[number];
 
 export interface OneClickConfig {
   /** API base URL. Defaults to {@link ONE_CLICK_BASE_URL}. */
   baseUrl?: string;
-  /** Partner API key, sent as `X-API-Key`. Unauthenticated quotes pay an extra fee. */
+  /** Partner key or JWT, sent as `X-API-Key`. Unauthenticated quotes pay an extra fee. */
   apiKey?: string;
   /** Fetch implementation. Defaults to `globalThis.fetch`. */
   fetch?: typeof globalThis.fetch;
-  /** Per-request timeout in milliseconds. Defaults to 30 000. */
+  /** Per-request timeout in milliseconds, covering headers and body. Defaults to 30 000. */
   timeoutMs?: number;
 }
 
@@ -103,7 +92,8 @@ const SwapDetailsSchema = z.object({
 });
 
 const StatusResponseSchema = z.object({
-  status: z.enum(SWAP_STATUSES),
+  /** Any string: see {@link SWAP_STATUSES} for the documented values. */
+  status: z.string(),
   updatedAt: z.string().optional(),
   quoteResponse: QuoteResponseSchema,
   swapDetails: SwapDetailsSchema.default({}),
@@ -147,8 +137,8 @@ export class OneClickError extends Error {
 }
 
 /**
- * The 1Click API was unreachable, timed out, or answered 5xx. Callers must treat
- * the outcome as unknown rather than as a failed payment.
+ * The 1Click API was unreachable, timed out, answered 5xx, or its answer could not be read.
+ * The outcome is unknown: callers must not treat it as a failed payment.
  */
 export class OneClickUnavailableError extends OneClickError {
   /**
@@ -215,7 +205,7 @@ export function createOneClickClient(config: OneClickConfig = {}): OneClickClien
 }
 
 /**
- * Performs one HTTP call. Network failures, timeouts and 5xx become
+ * Performs one HTTP call. Network failures, timeouts, 5xx and unreadable 2xx bodies become
  * {@link OneClickUnavailableError}; other statuses are returned for the caller to judge.
  *
  * @param config - Client configuration
@@ -224,7 +214,7 @@ export function createOneClickClient(config: OneClickConfig = {}): OneClickClien
  * @param options - JSON body and query parameters
  * @param options.body - JSON-encoded request body
  * @param options.query - Query string parameters
- * @returns HTTP status and parsed JSON body (undefined when the body is not JSON)
+ * @returns HTTP status and parsed JSON body (undefined when an error body is not JSON)
  */
 async function call(
   config: OneClickConfig,
@@ -256,7 +246,18 @@ async function call(
     });
   }
 
-  const body: unknown = await response.json().catch(() => undefined);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    if (response.ok) {
+      throw new OneClickUnavailableError(`1Click response could not be read: ${method} ${path}`, {
+        status: response.status,
+        cause: error,
+      });
+    }
+    body = undefined;
+  }
   if (response.status >= 500) {
     throw new OneClickUnavailableError(`1Click returned ${response.status} for ${method} ${path}`, {
       status: response.status,

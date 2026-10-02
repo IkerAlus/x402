@@ -1,4 +1,4 @@
-import type { SwapStatus, Token } from "../../../src/oneclick/client";
+import type { Token } from "../../../src/oneclick/client";
 
 /** Token entries shaped like live `GET /v0/tokens` data (2026-09). */
 export const defaultTokens: Token[] = [
@@ -24,6 +24,13 @@ export const defaultTokens: Token[] = [
     symbol: "USDC",
     contractAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
   },
+  {
+    assetId: "nep141:wrap.near",
+    decimals: 24,
+    blockchain: "near",
+    symbol: "wNEAR",
+    contractAddress: "wrap.near",
+  },
 ];
 
 export interface FakeQuote {
@@ -31,7 +38,8 @@ export interface FakeQuote {
   depositMemo?: string;
   quoteRequest: Record<string, unknown>;
   quote: Record<string, unknown>;
-  status: SwapStatus;
+  /** Any string, like the live service: documented values or undocumented ones. */
+  status: string;
   submittedTxHashes: string[];
   swapDetails: Record<string, unknown>;
 }
@@ -56,11 +64,7 @@ export interface FakeOneClick {
   /** Overrides fields of the next wet quote (e.g. `depositMemo`). */
   nextQuote(overrides: Record<string, unknown>): void;
   /** Moves a quote to `status` and merges `swapDetails` overrides. */
-  setStatus(
-    depositAddress: string,
-    status: SwapStatus,
-    swapDetails?: Record<string, unknown>,
-  ): void;
+  setStatus(depositAddress: string, status: string, swapDetails?: Record<string, unknown>): void;
 }
 
 /**
@@ -127,7 +131,6 @@ export function createFakeOneClick(options: { tokens?: Token[] } = {}): FakeOneC
       const depositAddress = `0x${mintCounter.toString(16).padStart(40, "0")}`;
       const minted: FakeQuote = {
         depositAddress,
-        ...(body.depositMode === "MEMO" && { depositMemo: `${mintCounter}` }),
         quoteRequest: body,
         quote: {
           ...quote,

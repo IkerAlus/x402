@@ -5,7 +5,7 @@ import {
   OneClickUnavailableError,
   type QuoteRequest,
 } from "../../src/oneclick/client";
-import { createFakeOneClick, defaultTokens } from "./fakes/oneclick";
+import { createFakeOneClick, defaultTokens } from "./fixtures/oneclick.fixture";
 
 const wetQuote: QuoteRequest = {
   dry: false,
@@ -69,7 +69,7 @@ describe("1Click client", () => {
     });
   });
 
-  it("maps 5xx and transport failures to OneClickUnavailableError", async () => {
+  it("maps 5xx, transport failures and unreadable 2xx bodies to OneClickUnavailableError", async () => {
     const { fake, client } = setup();
     fake.failNextRequests(1);
     await expect(client.tokens()).rejects.toBeInstanceOf(OneClickUnavailableError);
@@ -83,6 +83,11 @@ describe("1Click client", () => {
     expect(error).toBeInstanceOf(OneClickUnavailableError);
     expect(error.status).toBe(0);
     expect(error.cause).toBeInstanceOf(TypeError);
+
+    const truncated = createOneClickClient({
+      fetch: async () => new Response("<html>not json", { status: 200 }),
+    });
+    await expect(truncated.tokens()).rejects.toBeInstanceOf(OneClickUnavailableError);
   });
 
   it("times out through the abort signal", async () => {
@@ -124,10 +129,18 @@ describe("1Click client", () => {
     expect(done?.swapDetails.destinationChainTxHashes[0].hash).toMatch(/^0xdest/);
   });
 
+  it("passes undocumented status values through instead of failing", async () => {
+    const { fake, client } = setup();
+    const minted = await client.quote(wetQuote);
+    const depositAddress = minted.quote.depositAddress!;
+    fake.setStatus(depositAddress, "KYT_BLOCKED");
+    expect((await client.status(depositAddress))?.status).toBe("KYT_BLOCKED");
+  });
+
   it("parses the token list and rejects an unexpected shape", async () => {
     const { client } = setup();
     const tokens = await client.tokens();
-    expect(tokens.map(t => t.symbol)).toEqual(["USDC", "USDC", "ETH", "USDC"]);
+    expect(tokens.map(t => t.symbol)).toEqual(["USDC", "USDC", "ETH", "USDC", "wNEAR"]);
     expect(tokens[2].contractAddress).toBeUndefined();
 
     const garbage = createOneClickClient({
