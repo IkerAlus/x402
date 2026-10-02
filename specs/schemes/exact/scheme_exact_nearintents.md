@@ -260,10 +260,11 @@ The proof is observation-dependent: validation requires observing the origin net
 ## Resource Server Behavior
 
 - Reject a payload whose `resource.url` is not the resource advertised for this request.
-- Call `/verify` and `/settle` with `paymentRequirements` set to the server's own unquoted entry for `accepted.network` and `accepted.asset`, never with `accepted`. Destination terms MUST come from the server's own configuration.
+- Call `/verify` and `/settle` with `paymentRequirements` set to the server's own unquoted entry for `accepted.network` and `accepted.asset`, never with `accepted`. Destination terms MUST come from the server's own configuration, or from its record of the operation.
 - `extra.indicativeAmount` MAY change between responses. Do not reject a payload because the echoed value differs from the current one.
 - On a `quote` payload, call `/verify`. On `isValid: true`, return a second 402 with the quoted entry built from `VerifyResponse.extra`: `depositAddress` becomes `payTo`, `amountIn` becomes `amount`, and `refundDeadline` and `operationToken` (plus `depositMemo` where present) go into `extra`. `maxTimeoutSeconds` is unchanged. Do not execute the route handler.
-- On a `deposit` payload, call `/settle` before the route handler. Execute the handler only after `success: true`, once per operation. On `settlement_pending`, return the pending receipt.
+- When returning a quoted entry, record the operation (`network`, `depositAddress`, `depositMemo`) with the unquoted entry it was quoted from and the facilitator that minted it, for as long as it can be redeemed (at least 24 hours after `refundDeadline`). Settle it with the recorded entry and facilitator, so later changes to the server's terms do not affect operations already quoted. Without a record, use the current configuration.
+- On a `deposit` payload, call `/settle` before the route handler. On `success: true`, mark the operation as executed, atomically across all server instances, then execute the handler. A later presentation of an executed operation receives `exact_near_intents_operation_executed` and does not execute it again; recovering a lost response is application-defined. On `settlement_pending`, return the pending receipt.
 
 ---
 
@@ -274,7 +275,7 @@ The proof is observation-dependent: validation requires observing the origin net
 `/verify` with a `quote` payload mints a quote. It commits no funds.
 
 1. **Structural**: `accepted.extra.assetTransferMethod` is `near-intents`; `payload.type` is `quote`; `resource.url` is present; `payload.refundTo` is a valid address on `accepted.network`; `accepted.network` and `accepted.asset` equal those of `paymentRequirements`.
-2. **Rate limit**: facilitators MUST rate-limit quote payloads per requester. A facilitator MAY return the same live quote for an identical (`resource`, `accepted`, `refundTo`) within its validity, instead of minting again.
+2. **Rate limit**: facilitators MUST rate-limit quote payloads per requester. Each quote payload mints a new quote: a facilitator MUST NOT return an issued `operationToken` to another request.
 3. **Quote**: `POST {apiBaseUrl}/v0/quote`, with origin and destination mapped to 1Click identifiers via `GET /v0/tokens`:
    - `dry: false`, `swapType: EXACT_OUTPUT`, `depositType: ORIGIN_CHAIN`, `depositMode: MEMO` for origin networks that require a memo (otherwise `SIMPLE`).
    - `amount` = `destination.amount`, `recipient` = `destination.recipient`, `recipientType: DESTINATION_CHAIN`.
@@ -314,25 +315,26 @@ If 1Click returns no quote, the facilitator returns `isValid: false` with `inval
 - `destinationHash` is the lowercase hex SHA-256 of `network:asset:amount:recipient`, taken from `paymentRequirements.extra.destination`.
 - The token needs no storage: the facilitator recomputes `mac` at settlement.
 - A facilitator MUST keep a key while any token issued with it is unexpired.
+- Only the issuing facilitator, or one that shares its keys and operation records, can redeem a token.
 - The token is opaque to clients and resource servers. It is transmitted only in the quoted entry and the deposit payload. It MUST NOT appear on chain or in receipts.
 
 ### Settlement (`/settle`)
 
-The rules below run inside `/settle`, before the resource executes. An operation is identified by its `operationToken`.
+The rules below run inside `/settle`, before the resource executes. An operation is identified by its instrument: `<network>:<depositAddress>[:<depositMemo>]`.
 
 1. **Structural**: `accepted.extra.assetTransferMethod` is `near-intents`; `payload.type` is `deposit`; `resource.url` is present; `payload.depositAddress` and `payload.txHash` are well-formed for `accepted.network`; `accepted.network` and `accepted.asset` equal those of `paymentRequirements`.
-2. **Token**: a token past its `expiry` is rejected with `invalid_exact_near_intents_token_expired`, without any lookup. Otherwise the facilitator recomputes `mac` from `accepted.network`, `payload.depositAddress`, `payload.depositMemo`, `resource.url` and `paymentRequirements.extra.destination`. A mismatch or an unknown `keyId` is rejected with `invalid_exact_near_intents_token_invalid`.
+2. **Token**: a token past its `expiry` is rejected with `invalid_exact_near_intents_token_expired`, without any lookup. Otherwise the facilitator recomputes `mac` from `accepted.network`, `payload.depositAddress`, `payload.depositMemo`, `resource.url` and `paymentRequirements.extra.destination`. A mismatch or an unknown `keyId` is rejected with `invalid_exact_near_intents_token_invalid`. If the operation already has a recorded `SettlementResponse`, return it unchanged, before any external call.
 3. **Quote terms**: read `GET /v0/status?depositAddress=<payload.depositAddress>[&depositMemo=<payload.depositMemo>]`. The `recipient`, destination asset and `amount` of `quoteResponse.quoteRequest` MUST match `paymentRequirements.extra.destination`, mapped as at quote time; otherwise `invalid_exact_near_intents_quote_mismatch`.
-4. **Claim**: claim `<network>:<txHash>` as in-flight for this operation. Concurrent presentations of the same proof MUST result in exactly one claim; the others receive `settlement_pending`. A proof already consumed by this operation returns the recorded `SettlementResponse`. A proof consumed by a different operation is rejected with `invalid_exact_near_intents_proof_bound`. A claim MUST expire, and a worker whose claim has expired MUST NOT consume.
-5. **Deposit**: `txHash` is a confirmed transaction on `accepted.network` that transfers `accepted.asset` to `payload.depositAddress` (with `payload.depositMemo` where required). A transaction confirmed on the origin network that does not pay the instrument MUST be rejected with `invalid_exact_near_intents_deposit_not_found`. A transaction not yet observable is not final: release the claim and return `settlement_pending`. A facilitator MAY reject a transaction still unknown to the origin network after a documented observation window.
-6. **Outcome**: notify the backend (`POST /v0/deposit/submit`), then poll `GET /v0/status`. The response carries `status` and `swapDetails`.
+4. **Claim**: claim the operation as in-flight. Concurrent presentations of the same operation MUST result in exactly one claim; the others receive `settlement_pending`. A claim MUST expire, and a worker whose claim has expired MUST NOT record a result.
+5. **Deposit**: `txHash` is a confirmed transaction on `accepted.network` that transfers `accepted.asset` to `payload.depositAddress` (with `payload.depositMemo` where required). A transaction confirmed on the origin network that does not pay the instrument MUST be rejected with `invalid_exact_near_intents_deposit_not_found`. A transaction not yet observable is not final: release the claim and return `settlement_pending`. A facilitator MAY reject a transaction still unknown to the origin network after a documented observation window. Rejecting a transaction releases the claim and does not end the operation: the client MAY present another transaction that pays the instrument.
+6. **Outcome**: optionally notify the backend (`POST /v0/deposit/submit`), then poll `GET /v0/status`. The response carries `status` and `swapDetails`.
    - Statuses `KNOWN_DEPOSIT_TX`, `PENDING_DEPOSIT`, `PROCESSING` and `INCOMPLETE_DEPOSIT` are non-terminal.
    - `SUCCESS`, `REFUNDED` and `FAILED` are terminal.
    - The proof is **valid** only when status is `SUCCESS` and `txHash` is among `swapDetails.originChainTxHashes[].hash`: the merchant received the destination asset. A surplus refund after `SUCCESS` does not affect validity.
    - `REFUNDED` and `FAILED` are failures (see [Refunds](#refunds)).
-7. **Consume and respond**: consume the proof, record the `SettlementResponse` against the operation, and return it. On a terminal failure, consume the proof, and record and return the failure. An operation serves at most one proof. The recorded response is returned unchanged to any later presentation of the same operation.
+7. **Record and respond**: on a terminal outcome, success or failure, record the `SettlementResponse` against the operation and return it. An operation has at most one recorded result, returned unchanged to any later presentation (step 2).
 
-**Not yet final:** If no terminal outcome is observable within the facilitator's settlement window, it MUST NOT consume the proof, MUST release the in-flight claim, and MUST return `success: false` with `errorReason: "settlement_pending"`, `transaction` = the deposit `txHash` and `network` = `accepted.network`, per section 9 of the core specification. The client MUST retry with the same `operationToken` and `txHash`, and MUST NOT fund a new quote while this operation is pending. An abnormally terminated attempt MUST NOT leave a proof claimed.
+**Not yet final:** If no terminal outcome is observable within the facilitator's settlement window, it MUST NOT record a result, MUST release the in-flight claim, and MUST return `success: false` with `errorReason: "settlement_pending"`, `transaction` = the deposit `txHash` and `network` = `accepted.network`, per section 9 of the core specification. The client MUST retry with the same `operationToken`, and MUST NOT fund a new quote while this operation is pending. The retry MAY carry another deposit transaction of the operation, such as one that replaced the original. An abnormally terminated attempt MUST NOT leave an operation claimed.
 
 **Finality** is delivery to the merchant. A facilitator MUST NOT advance settlement on its own origin-network observation.
 
@@ -388,7 +390,7 @@ Returned in `PAYMENT-RESPONSE`. Under `upfront` the receipt is returned even whe
 
 ### Retention
 
-The facilitator keeps only used-proof records, keyed by `<network>:<txHash>`: the operation's token, and the in-flight claim or the recorded `SettlementResponse`. Each record is retained until its token's `expiry`. After that the token is rejected before any lookup, so a dropped record cannot be replayed.
+The facilitator keeps only operation records, keyed by the instrument: the in-flight claim or the recorded `SettlementResponse`. Each record is retained until the expiry of the operation's token. After that the token is rejected before any lookup, so a dropped record cannot be replayed.
 
 ---
 
@@ -396,9 +398,9 @@ The facilitator keeps only used-proof records, keyed by `<network>:<txHash>`: th
 
 ### Replay Prevention
 
-- `(network, txHash)` is bound to the first `operationToken` that redeems it and rejected under any other. Presenting the same token and hash again returns the recorded result and does not execute the resource again.
+- An operation has one result. Presenting it again, with any of its deposit transactions, returns the recorded result and does not execute the resource again. A transaction proves only the instrument it pays.
 - The token binds the instrument, the resource, the destination terms and an expiry. A deposit cannot be redeemed at another resource or merchant, or after `expiry`.
-- The token binds redemption to the party that received the quote. An observer of the origin network cannot redeem a deposit.
+- The token is a bearer credential: whoever holds it can redeem the operation. It is only returned to the request that minted the quote, so an observer of the origin network cannot redeem a deposit.
 
 ### Amount Validation
 
@@ -424,9 +426,9 @@ The facilitator publishes its permitted range and default in `/supported`, as `k
 
 ### Client Obligations
 
-- Check the quoted `amount` before depositing. The unquoted entry carries only `extra.indicativeAmount`, which is not binding.
+- Apply your spending limits to the quoted `amount` before depositing. The unquoted entry carries only `extra.indicativeAmount`, which is not binding.
 - Persist the quoted entry's `payTo`, `extra.depositMemo` and `extra.operationToken` before depositing and the `txHash` after. Loss of the `operationToken` leaves a delivered payment unredeemable.
-- Present the same `operationToken` and `txHash` on every retry. MUST NOT fund a new quote while an operation is pending.
+- Present the same `operationToken` on every retry, with a deposit transaction of the operation; a replacement transaction is allowed. MUST NOT fund a new quote while an operation is pending.
 - Use a `refundTo` you control on the origin network.
 
 ### Deposit Address Authenticity
@@ -447,10 +449,10 @@ Not-yet-final settlements use the core `settlement_pending` error reason (sectio
 | `invalid_exact_near_intents_token_invalid` | `operationToken` does not verify against `accepted`, `resource` and the server's destination terms, or its `keyId` is unknown. |
 | `invalid_exact_near_intents_token_expired` | `operationToken` is past its `expiry`. |
 | `invalid_exact_near_intents_quote_mismatch` | 1Click's `quoteRequest` does not match the server's destination terms. |
-| `invalid_exact_near_intents_proof_bound` | `txHash` is already bound to a different operation. |
 | `invalid_exact_near_intents_deposit_not_found` | `txHash` is confirmed but does not pay the instrument, or remains unknown to the origin network after the observation window. |
 | `exact_near_intents_insufficient_deposit` | `REFUNDED` with `refundReason` indicating a partial deposit. 1Click refunds `refundTo`. |
 | `exact_near_intents_payment_failed` | No delivery. 1Click refunds `refundTo`. |
+| `exact_near_intents_operation_executed` | The resource server already executed this operation. |
 
 ---
 
