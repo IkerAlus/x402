@@ -11,7 +11,7 @@ import type {
   VerifyResponse,
 } from "@x402/core/types";
 
-import { MEMO_PROGRAM_ADDRESS } from "../../constants";
+import { ADVERTISED_TRANSACTION_VERSIONS, MEMO_PROGRAM_ADDRESS } from "../../constants";
 import {
   discoverChannelsByRentPayer,
   type DiscoveredChannel,
@@ -99,6 +99,7 @@ import {
   validateRefund,
 } from "./seal";
 import {
+  advancesSettled,
   assertServerModeProof as checkServerModeProof,
   assertServerModeRefundProof,
   voucherSignerFor,
@@ -197,8 +198,8 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
     const addresses = this.signer.getAddresses();
     return {
       feePayer: addresses[Math.floor(Math.random() * addresses.length)],
-      // Servers copy the idle window into the 402: it is how long they have
-      // to claim before an idle channel is closed at its onchain watermark.
+      transactionVersions: [...ADVERTISED_TRANSACTION_VERSIONS],
+      // Copied into the 402: how long servers have to claim before an idle close.
       ...(this.maxIdleSecs > 0 ? { maxIdleSecs: this.maxIdleSecs } : {}),
       ...(this.delegatedReceiverAuth
         ? { receiverAuthorizer: this.delegatedReceiverAuth.receiverAuthorizer }
@@ -812,6 +813,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         ChannelStatus.Open,
       ]);
       const expectedDeposit = existing.deposit + deposit;
+      const settled = existing.settlement.settled;
       switch (proof.signer) {
         case "server":
           if (charge > expectedDeposit) {
@@ -821,7 +823,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
           }
           break;
         case "client":
-          if (proofAmount < charge || proofAmount > expectedDeposit) {
+          if (!advancesSettled(proofAmount, settled, charge) || proofAmount > expectedDeposit) {
             throw new Error(
               `${BatchError.CUMULATIVE_AMOUNT_MISMATCH}: voucher exceeds topped-up ceiling`,
             );
@@ -1134,6 +1136,10 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
       ChannelStatus.Open,
     ]);
     if (cumulative > channel.deposit) throw new Error(BatchError.CUMULATIVE_EXCEEDS_DEPOSIT);
+    const charge = parseU64(requirements.amount, "amount");
+    if (!advancesSettled(cumulative, channel.settlement.settled, charge)) {
+      throw new Error(BatchError.CUMULATIVE_AMOUNT_MISMATCH);
+    }
     return channel;
   }
 
@@ -1920,6 +1926,7 @@ export class BatchSvmScheme implements SchemeNetworkFacilitator {
         this.distributeInstruction(channelId, channel, terms as BatchTerms, requirements),
       fetchChannel: (network, channelId) => this.fetchChannel(network, channelId),
       nowSeconds: () => Math.floor(Date.now() / 1000),
+      onDistributionConfirmed: this.config.onDistributionConfirmed,
       pendingStore: this.pendingStore,
       readChannel: (network, channelId) => this.readChannel(network, channelId),
       isDelegatedAuthorizer: bound => isDelegatedAuthorizer(this.delegatedReceiverAuth, bound),
