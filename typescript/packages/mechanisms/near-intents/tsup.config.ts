@@ -3,6 +3,7 @@ import { defineConfig } from "tsup";
 const baseConfig = {
   entry: {
     index: "src/index.ts",
+    "origins/evm": "src/origins/evm.ts",
   },
   dts: {
     resolve: true,
