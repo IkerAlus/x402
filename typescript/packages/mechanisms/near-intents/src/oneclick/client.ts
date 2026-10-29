@@ -96,7 +96,7 @@ const StatusResponseSchema = z.object({
   status: z.string(),
   updatedAt: z.string().optional(),
   quoteResponse: QuoteResponseSchema,
-  swapDetails: SwapDetailsSchema.default({}),
+  swapDetails: SwapDetailsSchema.prefault({}),
 });
 export type StatusResponse = z.infer<typeof StatusResponseSchema>;
 
@@ -295,7 +295,7 @@ function expectOk(response: RawResponse, label: string): unknown {
  * @param label - Endpoint label for the error message
  * @returns The validated value
  */
-function parse<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, value: unknown, label: string): T {
+function parse<T>(schema: z.ZodType<T, unknown>, value: unknown, label: string): T {
   const result = schema.safeParse(value);
   if (!result.success) {
     throw new OneClickError(`1Click ${label} response has an unexpected shape`, {
