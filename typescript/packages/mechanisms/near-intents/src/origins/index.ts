@@ -35,6 +35,9 @@ export interface OriginAdapter {
   /** Reverse lookup for core's USD spend caps. */
   findDefaultAsset?: FindDefaultAsset;
 
+  /** Whether deposits on this namespace need a memo or destination tag (1Click `depositMode: MEMO`). */
+  requiresMemo?: boolean;
+
   /**
    * Whether `address` is well-formed for the namespace.
    *

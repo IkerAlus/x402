@@ -1,5 +1,19 @@
 // Constants
-export { ONE_CLICK_BASE_URL, ONE_CLICK_BLOCKCHAINS, SWAP_STATUSES } from "./constants";
+export {
+  ASSET_TRANSFER_METHOD,
+  DEFAULT_CLAIM_TTL_MS,
+  DEFAULT_GRACE_SECONDS,
+  DEFAULT_OBSERVATION_WINDOW_MS,
+  DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_QUOTE_RATE_LIMIT,
+  DEFAULT_SETTLE_WINDOW_MS,
+  DEFAULT_SLIPPAGE_TOLERANCE,
+  DEFAULT_TOKENS_TTL_MS,
+  ONE_CLICK_BASE_URL,
+  ONE_CLICK_BLOCKCHAINS,
+  PAYMENT_FLOW,
+  SWAP_STATUSES,
+} from "./constants";
 export type { SwapStatus } from "./constants";
 
 // Error reasons
@@ -13,6 +27,24 @@ export {
   ERROR_TOKEN_EXPIRED,
   ERROR_TOKEN_INVALID,
 } from "./errors";
+
+// Wire schemas and response builders
+export {
+  DepositPayloadSchema,
+  DestinationSchema,
+  QuoteExtraSchema,
+  QuotePayloadSchema,
+  QuotedExtraSchema,
+  UnquotedExtraSchema,
+} from "./schemas";
+export type {
+  DepositPayload,
+  QuoteExtra,
+  QuotePayload,
+  QuotedExtra,
+  UnquotedExtra,
+} from "./schemas";
+export { failureResponse, pendingResponse, quotedEntryFrom, successResponse } from "./exact/wire";
 
 // 1Click Swap API client, asset mapping, outcome mapping and dry-quote cache
 export { createOneClickClient, OneClickError, OneClickUnavailableError } from "./oneclick/client";
@@ -52,6 +84,10 @@ export type {
   DepositTarget,
   OriginAdapter,
 } from "./origins";
+
+// Rate limiting
+export { TokenBucket } from "./rateLimit";
+export type { RateLimit } from "./rateLimit";
 
 // Types
 export type { DestinationTerms } from "./types";

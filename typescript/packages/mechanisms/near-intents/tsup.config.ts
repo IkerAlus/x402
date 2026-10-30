@@ -4,6 +4,7 @@ const baseConfig = {
   entry: {
     index: "src/index.ts",
     "origins/evm": "src/origins/evm.ts",
+    "exact/facilitator/index": "src/exact/facilitator/index.ts",
   },
   dts: {
     resolve: true,

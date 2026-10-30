@@ -83,6 +83,16 @@
         "types": "./dist/cjs/origins/evm.d.ts",
         "default": "./dist/cjs/origins/evm.js"
       }
+    },
+    "./exact/facilitator": {
+      "import": {
+        "types": "./dist/esm/exact/facilitator/index.d.mts",
+        "default": "./dist/esm/exact/facilitator/index.mjs"
+      },
+      "require": {
+        "types": "./dist/cjs/exact/facilitator/index.d.ts",
+        "default": "./dist/cjs/exact/facilitator/index.js"
+      }
     }
   },
   "files": [

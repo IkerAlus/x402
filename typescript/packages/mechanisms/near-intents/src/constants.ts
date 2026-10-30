@@ -34,3 +34,33 @@ export const ONE_CLICK_BLOCKCHAINS: Readonly<Record<string, string>> = {
   "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp": "sol",
   "near:mainnet": "near",
 };
+
+/** `extra.assetTransferMethod` of this method. */
+export const ASSET_TRANSFER_METHOD = "near-intents";
+
+/** The only `paymentFlow` of this method. */
+export const PAYMENT_FLOW = "upfront";
+
+/** Operation-token grace after the refund deadline, in seconds. The spec requires at least 24 h. */
+export const DEFAULT_GRACE_SECONDS = 86_400;
+
+/** Slippage tolerance range and default published in `/supported`, in basis points. */
+export const DEFAULT_SLIPPAGE_TOLERANCE = { min: 10, max: 300, default: 50 };
+
+/** Polling budget of one `/settle` call, under the facilitator HTTP client's 90 s timeout. */
+export const DEFAULT_SETTLE_WINDOW_MS = 20_000;
+
+/** Interval between `GET /v0/status` polls inside the settle window. */
+export const DEFAULT_POLL_INTERVAL_MS = 2_000;
+
+/** How long a transaction may stay unknown to the origin network before it is rejected. */
+export const DEFAULT_OBSERVATION_WINDOW_MS = 900_000;
+
+/** In-flight claim lifetime; an attempt that outlives its claim does not record a result. */
+export const DEFAULT_CLAIM_TTL_MS = 60_000;
+
+/** Lifetime of the cached `GET /v0/tokens` list. */
+export const DEFAULT_TOKENS_TTL_MS = 600_000;
+
+/** Quote rate limit, applied per `refundTo` and per resource URL. */
+export const DEFAULT_QUOTE_RATE_LIMIT = { capacity: 10, refillPerMinute: 10 };
