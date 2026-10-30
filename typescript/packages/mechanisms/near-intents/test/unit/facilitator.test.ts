@@ -31,6 +31,7 @@ import {
   quotePayload,
   quotedOperation,
 } from "./fixtures/facilitator.fixture";
+import { createFakeEvmChain } from "./fixtures/evm.fixture";
 import { createFakeOneClick } from "./fixtures/oneclick.fixture";
 
 const T0 = Date.parse("2026-10-30T10:00:00Z");
@@ -264,11 +265,11 @@ describe("facilitator settle (deposit)", () => {
       errorReason: "settlement_pending",
       network: ORIGIN_NETWORK,
       transaction: DEPOSIT_TX,
-      extra: { status: "KNOWN_DEPOSIT_TX" },
+      extra: { status: "PENDING_DEPOSIT" },
     });
     const key = operationKey(ORIGIN_NETWORK, quote.depositAddress);
     expect(await operations.get(key)).toBeUndefined();
-    expect(await operations.claim(key, Date.now() + 1)).toBe(true);
+    expect(await operations.claim(key, Date.now() + 1)).toBeDefined();
   });
 
   it("records refunds with the spec's terminal reasons", async () => {
@@ -378,7 +379,7 @@ describe("facilitator settle (deposit)", () => {
     });
     expect(
       await operations.claim(operationKey(ORIGIN_NETWORK, unknownAddress), Date.now() + 1),
-    ).toBe(true);
+    ).toBeDefined();
 
     const quoted = await quotedOperation(fx);
     fx.fake.failNextRequests(1);
@@ -405,7 +406,7 @@ describe("facilitator settle (deposit)", () => {
     expect(receipt.errorReason).toBe(ERROR_QUOTE_MISMATCH);
     const key = operationKey(ORIGIN_NETWORK, quote.depositAddress);
     expect(await operations.get(key)).toBeUndefined();
-    expect(await operations.claim(key, Date.now() + 1)).toBe(true);
+    expect(await operations.claim(key, Date.now() + 1)).toBeDefined();
   });
 
   it("waits for an unknown transaction within the observation window, then rejects it", async () => {
@@ -422,7 +423,7 @@ describe("facilitator settle (deposit)", () => {
     expect(rejected.errorReason).toBe(ERROR_DEPOSIT_NOT_FOUND);
     const key = operationKey(ORIGIN_NETWORK, quote.depositAddress);
     expect(await operations.get(key)).toBeUndefined();
-    expect(await operations.claim(key, Date.now() + 1)).toBe(true);
+    expect(await operations.claim(key, Date.now() + 1)).toBeDefined();
   });
 
   it("treats a broadcast but unmined transaction as pending", async () => {
@@ -451,5 +452,167 @@ describe("facilitator settle (deposit)", () => {
     const accepted = await fx.scheme.settle(depositPayload(requirements, quote, TX2), requirements);
     expect(accepted.success).toBe(true);
     expect(accepted.extra).toMatchObject({ originTxHash: TX2 });
+  });
+});
+
+describe("facilitator hardening", () => {
+  const oneClickFor = (fake = createFakeOneClick()) => createOneClickClient({ fetch: fake.fetch });
+
+  it("rejects configurations that cannot honour the spec or the attempt bounds", () => {
+    const origins = {
+      eip155: createEvmOrigin({ publicClient: createFakeEvmChain().publicClient }),
+    };
+    const base = { oneClick: oneClickFor(), tokenKeys: keys, origins };
+    const bad = [
+      { graceSeconds: 3_600 },
+      { claimTtlMs: 5_000, settleWindowMs: 5_000 },
+      { pollIntervalMs: 6_000, settleWindowMs: 5_000 },
+      { slippageTolerance: { min: 100, max: 50, default: 75 } },
+      { slippageTolerance: { min: 0, max: 20_000, default: 50 } },
+      { quoteRateLimit: { capacity: 0, refillPerMinute: 10 } },
+      {
+        origins: {
+          "eip155:8453": createEvmOrigin({
+            network: "eip155:42161",
+            publicClient: createFakeEvmChain().publicClient,
+          }),
+        },
+      },
+    ];
+    for (const overrides of bad) {
+      expect(() => new ExactNearIntentsScheme({ ...base, ...overrides })).toThrow(/near-intents:/);
+    }
+    expect(() => new ExactNearIntentsScheme({ ...base, graceSeconds: 86_400 })).not.toThrow();
+  });
+
+  it("refuses to issue a token for an unusable quote", async () => {
+    const fx = createFacilitatorFixture();
+    const requirements = makeRequirements();
+    for (const overrides of [
+      { depositAddress: "" },
+      { depositAddress: "nope" },
+      { amountIn: "not-an-amount" },
+      { amountIn: "0" },
+    ]) {
+      fx.fake.nextQuote(overrides);
+      const result = await fx.scheme.verify(quotePayload(requirements), requirements);
+      expect(result.isValid).toBe(false);
+      expect(result.invalidReason).toBe(ERROR_QUOTE_UNAVAILABLE);
+    }
+    const memoFx = createFacilitatorFixture({
+      origins: {
+        [ORIGIN_NETWORK]: {
+          ...createEvmOrigin({
+            network: ORIGIN_NETWORK,
+            publicClient: createFakeEvmChain().publicClient,
+          }),
+          requiresMemo: true,
+        },
+      },
+    });
+    memoFx.fake.nextQuote({ depositMemo: undefined });
+    const noMemo = await memoFx.scheme.verify(quotePayload(requirements), requirements);
+    expect(noMemo.invalidReason).toBe(ERROR_QUOTE_UNAVAILABLE);
+    expect(memoFx.fake.requests.at(-1)!.body).toMatchObject({ depositMode: "MEMO" });
+  });
+
+  it("answers pending when the token list cannot be refreshed, and keeps serving a stale list", async () => {
+    const fx = createFacilitatorFixture({ tokensTtlMs: 1 });
+    const { requirements, quote } = await quotedOperation(fx);
+    fund(fx, quote);
+    fx.fake.setStatus(quote.depositAddress, "SUCCESS", {
+      originChainTxHashes: [{ hash: DEPOSIT_TX }],
+    });
+    vi.advanceTimersByTime(10);
+    fx.fake.failNextRequests(1, "/v0/tokens");
+    const receipt = await fx.scheme.settle(
+      depositPayload(requirements, quote, DEPOSIT_TX),
+      requirements,
+    );
+    expect(receipt.success).toBe(true);
+  });
+
+  it("proceeds when the destination asset is no longer listed, but still checks recipient and amount", async () => {
+    const fx = createFacilitatorFixture({ tokensTtlMs: 1 });
+    const funded = await quotedOperation(fx);
+    const tampered = await quotedOperation(fx);
+    fund(fx, funded.quote);
+    fund(fx, tampered.quote, TX2);
+    fx.fake.setStatus(funded.quote.depositAddress, "SUCCESS", {
+      originChainTxHashes: [{ hash: DEPOSIT_TX }],
+    });
+    fx.fake.quotes.get(tampered.quote.depositAddress)!.quoteRequest.recipient = "0xSomeoneElse";
+    fx.fake.tokens.splice(
+      fx.fake.tokens.findIndex(t => t.blockchain === "base"),
+      1,
+    );
+    vi.advanceTimersByTime(10);
+    const delivered = await fx.scheme.settle(
+      depositPayload(funded.requirements, funded.quote, DEPOSIT_TX),
+      funded.requirements,
+    );
+    expect(delivered.success).toBe(true);
+    const mismatch = await fx.scheme.settle(
+      depositPayload(tampered.requirements, tampered.quote, TX2),
+      tampered.requirements,
+    );
+    expect(mismatch.errorReason).toBe(ERROR_QUOTE_MISMATCH);
+  });
+
+  it("ends the attempt within the settle window when the origin reader stalls", async () => {
+    const operations = new InMemoryFacilitatorOperationStore();
+    const chain = createFakeEvmChain();
+    const stalled = {
+      ...chain.publicClient,
+      getTransactionReceipt: () => new Promise<never>(() => undefined),
+    };
+    const fx = createFacilitatorFixture({
+      operations,
+      origins: {
+        [ORIGIN_NETWORK]: createEvmOrigin({ network: ORIGIN_NETWORK, publicClient: stalled }),
+      },
+    });
+    const { requirements, quote } = await quotedOperation(fx);
+    const settling = fx.scheme.settle(
+      depositPayload(requirements, quote, DEPOSIT_TX),
+      requirements,
+    );
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await settling).toMatchObject({ errorReason: "settlement_pending" });
+    expect(
+      await operations.claim(operationKey(ORIGIN_NETWORK, quote.depositAddress), Date.now() + 1),
+    ).toBeDefined();
+  });
+
+  it("keeps polling when the deposit notification fails", async () => {
+    const fx = createFacilitatorFixture();
+    const { requirements, quote } = await quotedOperation(fx);
+    fund(fx, quote);
+    fx.fake.failNextRequests(1, "/v0/deposit/submit");
+    const settling = fx.scheme.settle(
+      depositPayload(requirements, quote, DEPOSIT_TX),
+      requirements,
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    fx.fake.quotes.get(quote.depositAddress)!.submittedTxHashes.push(DEPOSIT_TX);
+    fx.fake.setStatus(quote.depositAddress, "SUCCESS");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect((await settling).success).toBe(true);
+  });
+
+  it("never returns an unrecorded terminal receipt when it lost its claim", async () => {
+    const operations = new InMemoryFacilitatorOperationStore();
+    operations.record = async () => false;
+    const fx = createFacilitatorFixture({ operations });
+    const { requirements, quote } = await quotedOperation(fx);
+    fund(fx, quote);
+    fx.fake.setStatus(quote.depositAddress, "SUCCESS", {
+      originChainTxHashes: [{ hash: DEPOSIT_TX }],
+    });
+    const receipt = await fx.scheme.settle(
+      depositPayload(requirements, quote, DEPOSIT_TX),
+      requirements,
+    );
+    expect(receipt).toMatchObject({ success: false, errorReason: "settlement_pending" });
   });
 });

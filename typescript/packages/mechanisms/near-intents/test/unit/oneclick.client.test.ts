@@ -119,8 +119,9 @@ describe("1Click client", () => {
     expect(fake.requests.at(-1)?.query).toEqual({ depositAddress, depositMemo: "777" });
 
     const known = await client.submitDeposit({ txHash: "0xdeposit", depositAddress, memo: "777" });
-    expect(known.status).toBe("KNOWN_DEPOSIT_TX");
-    expect(known.swapDetails.originChainTxHashes).toEqual([{ hash: "0xdeposit" }]);
+    expect(known.status).toBe("PENDING_DEPOSIT");
+    expect(known.swapDetails.originChainTxHashes).toEqual([]);
+    expect(known.swapDetails.amountIn).toBeUndefined();
 
     fake.setStatus(depositAddress, "SUCCESS", { amountOut: "1000000" });
     const done = await client.status(depositAddress, "777");

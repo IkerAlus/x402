@@ -144,3 +144,32 @@ describe("createEvmOrigin", () => {
     });
   });
 });
+
+describe("createEvmOrigin bound to a network", () => {
+  const BASE = "eip155:8453";
+
+  it("refuses clients connected to another chain and non-eip155 networks", () => {
+    const chain = createFakeEvmChain();
+    const onArbitrum = { ...chain.publicClient, chain: { id: 42161 } };
+    expect(() => createEvmOrigin({ network: BASE, publicClient: onArbitrum })).toThrow(
+      /chain 42161/,
+    );
+    expect(() => createEvmOrigin({ network: "solana:mainnet" })).toThrow(/not an eip155/);
+    const onBase = { ...chain.publicClient, chain: { id: 8453 } };
+    expect(createEvmOrigin({ network: BASE, publicClient: onBase }).network).toBe(BASE);
+  });
+
+  it("serves only its network", async () => {
+    const chain = createFakeEvmChain();
+    const origin = createEvmOrigin({ network: BASE, ...chain });
+    const onBase = { network: BASE, depositAddress: DEPOSIT, asset: USDC_BASE };
+    expect(await origin.readDeposit!(onBase, TX)).toEqual({ state: "unknown" });
+    await expect(origin.readDeposit!({ ...onBase, network: "eip155:42161" }, TX)).rejects.toThrow(
+      /cannot serve eip155:42161/,
+    );
+    await expect(
+      origin.sendDeposit!({ ...onBase, network: "eip155:1", amount: "1" }),
+    ).rejects.toThrow(/cannot serve eip155:1/);
+    expect(chain.writes).toHaveLength(0);
+  });
+});

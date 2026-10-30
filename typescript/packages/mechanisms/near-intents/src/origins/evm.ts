@@ -15,6 +15,8 @@ type Hex = `0x${string}`;
 
 /** The viem `PublicClient` methods the adapter uses. */
 export interface EvmPublicClient {
+  /** Configured chain, when the client carries one; checked against the bound network. */
+  chain?: { id: number };
   getTransactionReceipt(args: { hash: Hex }): Promise<{ status: string; logs: Log[] }>;
   getTransaction(args: { hash: Hex }): Promise<unknown>;
   waitForTransactionReceipt(args: {
@@ -26,6 +28,8 @@ export interface EvmPublicClient {
 
 /** The viem `WalletClient` method the adapter uses; the client must carry its account and chain. */
 export interface EvmWalletClient {
+  /** Configured chain, when the client carries one; checked against the bound network. */
+  chain?: { id: number };
   writeContract(args: {
     address: Hex;
     abi: readonly unknown[];
@@ -35,6 +39,11 @@ export interface EvmWalletClient {
 }
 
 export interface EvmOriginConfig {
+  /**
+   * CAIP-2 network the clients are connected to, e.g. `eip155:8453`. The adapter then refuses
+   * targets on any other network. Omit only for a single-chain deployment keyed by namespace.
+   */
+  network?: string;
   /** Enables `readDeposit`, and the confirmation wait of `sendDeposit`. */
   publicClient?: EvmPublicClient;
   /** Enables `sendDeposit`, together with `publicClient`. */
@@ -46,24 +55,62 @@ export interface EvmOriginConfig {
 /**
  * Origin adapter for `eip155` networks: ERC-20 deposits, read through `Transfer` logs.
  *
- * @param config - viem clients and the confirmation bound
+ * @param config - viem clients, the network they serve and the confirmation bound
  * @returns The adapter, with reading and sending only where the clients allow
  */
 export function createEvmOrigin(config: EvmOriginConfig = {}): OriginAdapter {
-  const { publicClient, walletClient, confirmationTimeoutMs } = config;
+  const { network, publicClient, walletClient, confirmationTimeoutMs } = config;
+  if (network !== undefined) {
+    const chainId = evmChainId(network);
+    for (const [label, client] of [
+      ["publicClient", publicClient],
+      ["walletClient", walletClient],
+    ] as const) {
+      if (client?.chain !== undefined && client.chain.id !== chainId) {
+        throw new Error(
+          `near-intents: ${label} is connected to chain ${client.chain.id}, not to ${network}`,
+        );
+      }
+    }
+  }
+  const assertNetwork = (requested: string): void => {
+    if (network !== undefined && requested !== network) {
+      throw new Error(`near-intents: origin adapter for ${network} cannot serve ${requested}`);
+    }
+  };
   const adapter: OriginAdapter = {
+    ...(network !== undefined && { network }),
     isAddress: address => isAddress(address),
     isTxHash: hash => isHash(hash) && !/^0x0+$/.test(hash),
     findDefaultAsset,
   };
   if (publicClient) {
-    adapter.readDeposit = (target, txHash) => readDeposit(publicClient, target, txHash);
+    adapter.readDeposit = async (target, txHash) => {
+      assertNetwork(target.network);
+      return readDeposit(publicClient, target, txHash);
+    };
   }
   if (publicClient && walletClient) {
-    adapter.sendDeposit = (order, onBroadcast) =>
-      sendDeposit(publicClient, walletClient, confirmationTimeoutMs, order, onBroadcast);
+    adapter.sendDeposit = async (order, onBroadcast) => {
+      assertNetwork(order.network);
+      return sendDeposit(publicClient, walletClient, confirmationTimeoutMs, order, onBroadcast);
+    };
   }
   return adapter;
+}
+
+/**
+ * Chain id of an `eip155` CAIP-2 network.
+ *
+ * @param network - CAIP-2 network
+ * @returns The chain id
+ */
+function evmChainId(network: string): number {
+  const match = /^eip155:(\d+)$/.exec(network);
+  if (!match) {
+    throw new Error(`near-intents: "${network}" is not an eip155 network`);
+  }
+  return Number(match[1]);
 }
 
 /**

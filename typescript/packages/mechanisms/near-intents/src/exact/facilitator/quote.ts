@@ -3,7 +3,7 @@ import { ERROR_QUOTE_UNAVAILABLE } from "../../errors";
 import { findToken } from "../../oneclick/assets";
 import { OneClickError } from "../../oneclick/client";
 import type { QuoteRequest, QuoteResponse, Token } from "../../oneclick/client";
-import { QuotePayloadSchema } from "../../schemas";
+import { QuoteExtraSchema, QuotePayloadSchema } from "../../schemas";
 import { issueOperationToken } from "../../token";
 import type { FacilitatorRuntime } from "./runtime";
 
@@ -80,9 +80,16 @@ export async function quote(
   } catch (error) {
     return oneClickFailure(error);
   }
+
   const { depositAddress, depositMemo, amountIn } = response.quote;
-  if (depositAddress === undefined) {
-    return invalid(ERROR_QUOTE_UNAVAILABLE, "1Click returned no deposit address");
+  const usable =
+    depositAddress !== undefined &&
+    origin.isAddress(depositAddress) &&
+    /^\d+$/.test(amountIn) &&
+    BigInt(amountIn) > 0n &&
+    (!origin.requiresMemo || depositMemo !== undefined);
+  if (!usable) {
+    return invalid(ERROR_QUOTE_UNAVAILABLE, "1Click returned an unusable quote");
   }
   const expiry = Math.floor(deadlineMs / 1000) + rt.config.graceSeconds;
   const operationToken = issueOperationToken(
@@ -90,16 +97,14 @@ export async function quote(
     { network, depositAddress, depositMemo, resource, destination },
     expiry,
   );
-  return {
-    isValid: true,
-    extra: {
-      depositAddress,
-      amountIn,
-      refundDeadline: deadline,
-      operationToken,
-      ...(depositMemo !== undefined && { depositMemo }),
-    },
-  };
+  const extra = QuoteExtraSchema.parse({
+    depositAddress,
+    amountIn,
+    refundDeadline: deadline,
+    operationToken,
+    ...(depositMemo !== undefined && { depositMemo }),
+  });
+  return { isValid: true, extra };
 }
 
 /**

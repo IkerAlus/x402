@@ -7,19 +7,23 @@ import {
 } from "../../errors";
 import { findToken } from "../../oneclick/assets";
 import { OneClickError } from "../../oneclick/client";
-import type { StatusResponse } from "../../oneclick/client";
+import type { StatusResponse, Token } from "../../oneclick/client";
 import { outcomeOf } from "../../oneclick/status";
 import type { Outcome } from "../../oneclick/status";
-import type { DepositTarget } from "../../origins";
+import type { DepositReading, DepositTarget } from "../../origins";
 import { DepositPayloadSchema } from "../../schemas";
 import { checkOperationToken } from "../../token";
 import { operationKey } from "../../utils";
 import { failureResponse, pendingResponse, successResponse } from "../wire";
 import type { FacilitatorRuntime } from "./runtime";
 
+/** The settle window elapsed while waiting on an external call. */
+class DeadlineError extends Error {}
+
 /**
  * `/settle` with a `deposit` payload, in the spec's order: structural checks, token,
- * recorded result, quote terms, claim, deposit, outcome, record.
+ * recorded result, quote terms, claim, deposit, outcome, record. The whole attempt ends
+ * within `settleWindowMs`: every external call gets the remaining budget.
  *
  * @param rt - Facilitator runtime
  * @param payload - Payment payload
@@ -31,6 +35,9 @@ export async function settle(
   payload: PaymentPayload,
   requirements: PaymentRequirements,
 ): Promise<SettleResponse> {
+  const deadline = Date.now() + rt.config.settleWindowMs;
+  const remaining = (): number => Math.max(0, deadline - Date.now());
+
   const inspected = rt.inspect(payload, requirements);
   if (!inspected.ok) {
     return failureResponse({
@@ -76,7 +83,7 @@ export async function settle(
 
   let status: StatusResponse | null;
   try {
-    status = await oneClick.status(depositAddress, depositMemo);
+    status = await oneClick.status(depositAddress, depositMemo, { timeoutMs: remaining() });
   } catch (error) {
     if (error instanceof OneClickError) {
       return pending("UNAVAILABLE");
@@ -87,24 +94,42 @@ export async function settle(
     return pending("NOT_FOUND");
   }
   const { quoteRequest } = status.quoteResponse;
-  const destinationToken = findToken(await rt.tokens(), destination.network, destination.asset);
+  let tokens: Token[];
+  try {
+    tokens = await withinDeadline(rt.tokens(remaining()), remaining());
+  } catch (error) {
+    if (error instanceof OneClickError || error instanceof DeadlineError) {
+      return pending("UNAVAILABLE");
+    }
+    throw error;
+  }
+  const destinationToken = findToken(tokens, destination.network, destination.asset);
+  const assetMatches =
+    destinationToken === undefined || quoteRequest.destinationAsset === destinationToken.assetId;
   if (
-    destinationToken === undefined ||
-    quoteRequest.destinationAsset !== destinationToken.assetId ||
+    !assetMatches ||
     quoteRequest.recipient !== destination.recipient ||
     quoteRequest.amount !== destination.amount
   ) {
     return fail(ERROR_QUOTE_MISMATCH);
   }
 
-  const claimExpiresAt = Date.now() + rt.config.claimTtlMs;
-  if (!(await operations.claim(key, claimExpiresAt))) {
+  const claimId = await operations.claim(key, Date.now() + rt.config.claimTtlMs);
+  if (claimId === undefined) {
     return (await operations.get(key)) ?? pending(status.status);
   }
   let recordedNow = false;
   try {
     const target: DepositTarget = { network, depositAddress, depositMemo, asset };
-    const reading = await origin.readDeposit!(target, txHash);
+    let reading: DepositReading;
+    try {
+      reading = await withinDeadline(origin.readDeposit!(target, txHash), remaining());
+    } catch (error) {
+      if (error instanceof DeadlineError) {
+        return pending(status.status);
+      }
+      throw error;
+    }
     if (reading.state === "confirmed-no-match") {
       return fail(ERROR_DEPOSIT_NOT_FOUND, "txHash does not pay the instrument");
     }
@@ -120,7 +145,7 @@ export async function settle(
 
     let outcome = outcomeOf(status, txHash);
     if (outcome.kind === "pending") {
-      outcome = await observe(rt, depositAddress, depositMemo, txHash, outcome);
+      outcome = await observe(rt, depositAddress, depositMemo, txHash, outcome, deadline);
     }
     if (outcome.kind === "pending") {
       return pending(outcome.status);
@@ -143,28 +168,33 @@ export async function settle(
           });
     const endsOperation =
       outcome.kind === "success" || outcome.errorReason !== ERROR_DEPOSIT_NOT_FOUND;
-    if (endsOperation && Date.now() < claimExpiresAt) {
-      const retainUntil = Number(operationToken.split(".")[1]) * 1000;
-      await operations.record(key, response, retainUntil);
-      recordedNow = true;
+    if (!endsOperation) {
+      return response;
     }
-    return response;
+    const retainUntil = Number(operationToken.split(".")[1]) * 1000;
+    if (await operations.record(key, claimId, response, retainUntil)) {
+      recordedNow = true;
+      return response;
+    }
+    return (await operations.get(key)) ?? pending(outcome.status);
   } finally {
     if (!recordedNow) {
-      await operations.release(key);
+      await operations.release(key, claimId);
     }
   }
 }
 
 /**
- * Notifies 1Click of the deposit, then polls the status until a terminal outcome or the end
- * of the settle window. 1Click failures end the observation with the last outcome.
+ * Notifies 1Click of the deposit (best effort), then polls the status until a terminal
+ * outcome or the attempt deadline. A 1Click failure ends the observation with the last
+ * outcome.
  *
  * @param rt - Facilitator runtime
  * @param depositAddress - Deposit address
  * @param depositMemo - Deposit memo, where the origin needs one
  * @param txHash - Presented deposit transaction
  * @param initial - Outcome read before the notification
+ * @param deadline - Attempt deadline in milliseconds
  * @returns The last observed outcome
  */
 async function observe(
@@ -173,29 +203,66 @@ async function observe(
   depositMemo: string | undefined,
   txHash: string,
   initial: Outcome,
+  deadline: number,
 ): Promise<Outcome> {
-  const { oneClick, settleWindowMs, pollIntervalMs } = rt.config;
-  const deadline = Date.now() + settleWindowMs;
+  const { oneClick, pollIntervalMs } = rt.config;
+  const remaining = (): number => Math.max(0, deadline - Date.now());
   let outcome = initial;
   try {
-    const submitted = await oneClick.submitDeposit({
-      txHash,
-      depositAddress,
-      ...(depositMemo !== undefined && { memo: depositMemo }),
-    });
+    const submitted = await oneClick.submitDeposit(
+      { txHash, depositAddress, ...(depositMemo !== undefined && { memo: depositMemo }) },
+      { timeoutMs: remaining() },
+    );
     outcome = outcomeOf(submitted, txHash);
-    while (outcome.kind === "pending" && Date.now() + pollIntervalMs <= deadline) {
-      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
-      const status = await oneClick.status(depositAddress, depositMemo);
-      if (status === null) {
-        break;
-      }
-      outcome = outcomeOf(status, txHash);
-    }
   } catch (error) {
     if (!(error instanceof OneClickError)) {
       throw error;
     }
   }
+  while (outcome.kind === "pending" && remaining() > pollIntervalMs) {
+    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    let polled: StatusResponse | null;
+    try {
+      polled = await oneClick.status(depositAddress, depositMemo, { timeoutMs: remaining() });
+    } catch (error) {
+      if (error instanceof OneClickError) {
+        break;
+      }
+      throw error;
+    }
+    if (polled === null) {
+      break;
+    }
+    outcome = outcomeOf(polled, txHash);
+  }
   return outcome;
+}
+
+/**
+ * Bounds a call by the remaining attempt budget. A late answer is discarded.
+ *
+ * @param promise - The call
+ * @param ms - Remaining budget in milliseconds
+ * @returns The call's result
+ */
+function withinDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  if (ms <= 0) {
+    return Promise.reject(new DeadlineError("near-intents: settle window elapsed"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new DeadlineError("near-intents: settle window elapsed")),
+      ms,
+    );
+    promise.then(
+      value => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      error => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }

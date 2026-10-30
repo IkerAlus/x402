@@ -14,6 +14,12 @@ export interface OneClickConfig {
   timeoutMs?: number;
 }
 
+/** Per-call overrides. */
+export interface OneClickCallOptions {
+  /** Timeout for this call, in milliseconds. Overrides the client default. */
+  timeoutMs?: number;
+}
+
 /** `POST /v0/quote` request body (the fields this mechanism uses). */
 export interface QuoteRequest {
   dry: boolean;
@@ -42,6 +48,12 @@ export interface SubmitDepositRequest {
   depositAddress: string;
   memo?: string;
 }
+
+/** 1Click sends `null` for fields it has not filled yet; they are read as absent. */
+const NullishString = z
+  .string()
+  .nullish()
+  .transform(value => value ?? undefined);
 
 const QuoteRequestEchoSchema = z.object({
   originAsset: z.string(),
@@ -84,17 +96,17 @@ const TransactionSchema = z.object({
 const SwapDetailsSchema = z.object({
   originChainTxHashes: z.array(TransactionSchema).default([]),
   destinationChainTxHashes: z.array(TransactionSchema).default([]),
-  amountIn: z.string().optional(),
-  amountOut: z.string().optional(),
-  depositedAmount: z.string().optional(),
-  refundedAmount: z.string().optional(),
-  refundReason: z.string().optional(),
+  amountIn: NullishString,
+  amountOut: NullishString,
+  depositedAmount: NullishString,
+  refundedAmount: NullishString,
+  refundReason: NullishString,
 });
 
 const StatusResponseSchema = z.object({
   /** Any string: see {@link SWAP_STATUSES} for the documented values. */
   status: z.string(),
-  updatedAt: z.string().optional(),
+  updatedAt: NullishString,
   quoteResponse: QuoteResponseSchema,
   swapDetails: SwapDetailsSchema.prefault({}),
 });
@@ -137,8 +149,9 @@ export class OneClickError extends Error {
 }
 
 /**
- * The 1Click API was unreachable, timed out, answered 5xx, or its answer could not be read.
- * The outcome is unknown: callers must not treat it as a failed payment.
+ * The 1Click API was unreachable, timed out, answered 5xx or an internal error, or its
+ * answer could not be read. The outcome is unknown: callers must not treat it as a failed
+ * payment.
  */
 export class OneClickUnavailableError extends OneClickError {
   /**
@@ -158,13 +171,20 @@ export class OneClickUnavailableError extends OneClickError {
 
 export interface OneClickClient {
   /** `GET /v0/tokens`. */
-  tokens(): Promise<Token[]>;
+  tokens(options?: OneClickCallOptions): Promise<Token[]>;
   /** `POST /v0/quote`. A wet quote (`dry: false`) mints a single-use deposit address. */
-  quote(request: QuoteRequest): Promise<QuoteResponse>;
-  /** `POST /v0/deposit/submit`. Speeds up deposit detection. */
-  submitDeposit(request: SubmitDepositRequest): Promise<StatusResponse>;
+  quote(request: QuoteRequest, options?: OneClickCallOptions): Promise<QuoteResponse>;
+  /** `POST /v0/deposit/submit`. Best effort: 1Click forwards the hash and returns the unchanged status. */
+  submitDeposit(
+    request: SubmitDepositRequest,
+    options?: OneClickCallOptions,
+  ): Promise<StatusResponse>;
   /** `GET /v0/status`. Resolves to `null` when the deposit address is unknown. */
-  status(depositAddress: string, depositMemo?: string): Promise<StatusResponse | null>;
+  status(
+    depositAddress: string,
+    depositMemo?: string,
+    options?: OneClickCallOptions,
+  ): Promise<StatusResponse | null>;
 }
 
 interface RawResponse {
@@ -180,20 +200,24 @@ interface RawResponse {
  */
 export function createOneClickClient(config: OneClickConfig = {}): OneClickClient {
   return {
-    async tokens() {
-      const response = await call(config, "GET", "/v0/tokens");
+    async tokens(options) {
+      const response = await call(config, "GET", "/v0/tokens", options);
       return parse(TokensSchema, expectOk(response, "GET /v0/tokens"), "tokens");
     },
-    async quote(request) {
-      const response = await call(config, "POST", "/v0/quote", { body: request });
+    async quote(request, options) {
+      const response = await call(config, "POST", "/v0/quote", { ...options, body: request });
       return parse(QuoteResponseSchema, expectOk(response, "POST /v0/quote"), "quote");
     },
-    async submitDeposit(request) {
-      const response = await call(config, "POST", "/v0/deposit/submit", { body: request });
+    async submitDeposit(request, options) {
+      const response = await call(config, "POST", "/v0/deposit/submit", {
+        ...options,
+        body: request,
+      });
       return parse(StatusResponseSchema, expectOk(response, "POST /v0/deposit/submit"), "status");
     },
-    async status(depositAddress, depositMemo) {
+    async status(depositAddress, depositMemo, options) {
       const response = await call(config, "GET", "/v0/status", {
+        ...options,
         query: { depositAddress, ...(depositMemo !== undefined && { depositMemo }) },
       });
       if (response.status === 404) {
@@ -205,28 +229,31 @@ export function createOneClickClient(config: OneClickConfig = {}): OneClickClien
 }
 
 /**
- * Performs one HTTP call. Network failures, timeouts, 5xx and unreadable 2xx bodies become
- * {@link OneClickUnavailableError}; other statuses are returned for the caller to judge.
+ * Performs one HTTP call. Network failures, timeouts, 5xx, 1Click's internal errors
+ * reported as 400 and unreadable 2xx bodies become {@link OneClickUnavailableError}; other
+ * statuses are returned for the caller to judge.
  *
  * @param config - Client configuration
  * @param method - HTTP method
  * @param path - Endpoint path
- * @param options - JSON body and query parameters
+ * @param options - JSON body, query parameters and per-call timeout
  * @param options.body - JSON-encoded request body
  * @param options.query - Query string parameters
+ * @param options.timeoutMs - Timeout for this call
  * @returns HTTP status and parsed JSON body (undefined when an error body is not JSON)
  */
 async function call(
   config: OneClickConfig,
   method: "GET" | "POST",
   path: string,
-  options: { body?: unknown; query?: Record<string, string> } = {},
+  options: { body?: unknown; query?: Record<string, string>; timeoutMs?: number } = {},
 ): Promise<RawResponse> {
   const fetchFn = config.fetch ?? globalThis.fetch;
   const url = new URL(path, config.baseUrl ?? ONE_CLICK_BASE_URL);
   for (const [key, value] of Object.entries(options.query ?? {})) {
     url.searchParams.set(key, value);
   }
+  const timeoutMs = Math.max(0, options.timeoutMs ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
   let response: Response;
   try {
@@ -238,7 +265,7 @@ async function call(
         ...(config.apiKey !== undefined && { "x-api-key": config.apiKey }),
       },
       ...(options.body !== undefined && { body: JSON.stringify(options.body) }),
-      signal: AbortSignal.timeout(config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     throw new OneClickUnavailableError(`1Click request failed: ${method} ${path}`, {
@@ -258,7 +285,8 @@ async function call(
     }
     body = undefined;
   }
-  if (response.status >= 500) {
+  const internalError = response.status === 400 && detailOf(body) === "Internal server error";
+  if (response.status >= 500 || internalError) {
     throw new OneClickUnavailableError(`1Click returned ${response.status} for ${method} ${path}`, {
       status: response.status,
       body,

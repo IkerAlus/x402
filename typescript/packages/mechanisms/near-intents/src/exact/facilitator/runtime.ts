@@ -9,7 +9,9 @@ import {
   DEFAULT_SETTLE_WINDOW_MS,
   DEFAULT_SLIPPAGE_TOLERANCE,
   DEFAULT_TOKENS_TTL_MS,
+  MIN_GRACE_SECONDS,
 } from "../../constants";
+import { OneClickError } from "../../oneclick/client";
 import type { OneClickClient, QuoteRequest, Token } from "../../oneclick/client";
 import { InMemoryFacilitatorOperationStore } from "../../operationStore";
 import type { FacilitatorOperationStore } from "../../operationStore";
@@ -23,11 +25,15 @@ import type { DestinationTerms } from "../../types";
 export interface ExactNearIntentsFacilitatorConfig {
   oneClick: OneClickClient;
   tokenKeys: TokenKeys;
-  /** Origin adapters by CAIP-2 namespace (e.g. `eip155`). Each must implement `readDeposit`. */
+  /**
+   * Origin adapters keyed by CAIP-2 network (e.g. `eip155:8453`), or by namespace (e.g.
+   * `eip155`) for an adapter that serves every network of that namespace. The exact network
+   * wins. Each must implement `readDeposit`.
+   */
   origins: Record<string, OriginAdapter>;
   /** Operation claims and recorded results. Defaults to an in-memory, single-process store. */
   operations?: FacilitatorOperationStore;
-  /** Token grace after the refund deadline, in seconds. Defaults to 86 400. */
+  /** Token grace after the refund deadline, in seconds. At least 86 400; defaults to it. */
   graceSeconds?: number;
   /** Slippage range and default, in basis points. */
   slippageTolerance?: { min: number; max: number; default: number };
@@ -35,13 +41,13 @@ export interface ExactNearIntentsFacilitatorConfig {
   appFees?: QuoteRequest["appFees"];
   /** 1Click `referral` added to every quote. */
   referral?: string;
-  /** Polling budget of one `/settle`, in milliseconds. Defaults to 20 000. */
+  /** Budget of one `/settle` attempt, in milliseconds: every external call ends within it. Defaults to 20 000. */
   settleWindowMs?: number;
   /** Interval between status polls, in milliseconds. Defaults to 2 000. */
   pollIntervalMs?: number;
   /** How long a transaction may stay unknown to the origin network. Defaults to 15 minutes. */
   observationWindowMs?: number;
-  /** In-flight claim lifetime, in milliseconds. Defaults to 60 000. */
+  /** In-flight claim lifetime, in milliseconds. Must exceed `settleWindowMs`; defaults to 60 000. */
   claimTtlMs?: number;
   /** Quote rate limit per `refundTo` and per resource URL. */
   quoteRateLimit?: RateLimit;
@@ -69,8 +75,12 @@ export type Inspection =
 
 export interface FacilitatorRuntime {
   readonly config: ResolvedFacilitatorConfig;
-  /** Cached `GET /v0/tokens`. */
-  tokens(): Promise<Token[]>;
+  /**
+   * Cached `GET /v0/tokens`. A failed refresh serves the last list while one exists.
+   *
+   * @param timeoutMs - Timeout for the refresh, when one is needed
+   */
+  tokens(timeoutMs?: number): Promise<Token[]>;
   /** Takes one quote slot for the requester and one for the resource. */
   takeQuoteSlot(refundTo: string, resource: string): boolean;
   /** When `key` was first presented, recording now for a new key. */
@@ -80,17 +90,12 @@ export interface FacilitatorRuntime {
 }
 
 /**
- * Resolves the configuration and builds the per-process state the scheme needs.
+ * Resolves and validates the configuration and builds the per-process state the scheme needs.
  *
  * @param config - Facilitator configuration
  * @returns The runtime
  */
 export function createRuntime(config: ExactNearIntentsFacilitatorConfig): FacilitatorRuntime {
-  for (const [namespace, origin] of Object.entries(config.origins)) {
-    if (!origin.readDeposit) {
-      throw new Error(`near-intents: origin adapter for "${namespace}" cannot read deposits`);
-    }
-  }
   const resolved: ResolvedFacilitatorConfig = {
     ...config,
     operations: config.operations ?? new InMemoryFacilitatorOperationStore(),
@@ -103,6 +108,7 @@ export function createRuntime(config: ExactNearIntentsFacilitatorConfig): Facili
     quoteRateLimit: config.quoteRateLimit ?? DEFAULT_QUOTE_RATE_LIMIT,
     tokensTtlMs: config.tokensTtlMs ?? DEFAULT_TOKENS_TTL_MS,
   };
+  validate(resolved);
   const quoteSlots = new TokenBucket(resolved.quoteRateLimit);
   const seen = new Map<string, number>();
   let tokenList: { tokens: Token[]; fetchedAt: number } | undefined;
@@ -110,15 +116,21 @@ export function createRuntime(config: ExactNearIntentsFacilitatorConfig): Facili
 
   return {
     config: resolved,
-    tokens() {
+    tokens(timeoutMs) {
       if (tokenList && Date.now() - tokenList.fetchedAt < resolved.tokensTtlMs) {
         return Promise.resolve(tokenList.tokens);
       }
       loading ??= resolved.oneClick
-        .tokens()
+        .tokens({ timeoutMs })
         .then(tokens => {
           tokenList = { tokens, fetchedAt: Date.now() };
           return tokens;
+        })
+        .catch((error: unknown) => {
+          if (tokenList && error instanceof OneClickError) {
+            return tokenList.tokens;
+          }
+          throw error;
         })
         .finally(() => {
           loading = undefined;
@@ -146,9 +158,57 @@ export function createRuntime(config: ExactNearIntentsFacilitatorConfig): Facili
 }
 
 /**
+ * Rejects configurations that cannot honour the spec or the attempt bounds.
+ *
+ * @param config - Resolved configuration
+ */
+function validate(config: ResolvedFacilitatorConfig): void {
+  const positive: [string, number][] = [
+    ["settleWindowMs", config.settleWindowMs],
+    ["pollIntervalMs", config.pollIntervalMs],
+    ["observationWindowMs", config.observationWindowMs],
+    ["claimTtlMs", config.claimTtlMs],
+    ["tokensTtlMs", config.tokensTtlMs],
+    ["quoteRateLimit.capacity", config.quoteRateLimit.capacity],
+    ["quoteRateLimit.refillPerMinute", config.quoteRateLimit.refillPerMinute],
+  ];
+  for (const [name, value] of positive) {
+    if (!(Number.isFinite(value) && value > 0)) {
+      throw new Error(`near-intents: ${name} must be a positive number`);
+    }
+  }
+  if (!Number.isInteger(config.graceSeconds) || config.graceSeconds < MIN_GRACE_SECONDS) {
+    throw new Error(
+      `near-intents: graceSeconds must be an integer of at least ${MIN_GRACE_SECONDS}`,
+    );
+  }
+  if (config.pollIntervalMs > config.settleWindowMs) {
+    throw new Error("near-intents: pollIntervalMs must not exceed settleWindowMs");
+  }
+  if (config.claimTtlMs <= config.settleWindowMs) {
+    throw new Error("near-intents: claimTtlMs must exceed settleWindowMs");
+  }
+  const { min, max, default: fallback } = config.slippageTolerance;
+  const ordered = min >= 0 && min <= fallback && fallback <= max && max <= 10_000;
+  if (![min, max, fallback].every(Number.isInteger) || !ordered) {
+    throw new Error(
+      "near-intents: slippageTolerance must satisfy 0 <= min <= default <= max <= 10000",
+    );
+  }
+  for (const [key, origin] of Object.entries(config.origins)) {
+    if (!origin.readDeposit) {
+      throw new Error(`near-intents: origin adapter "${key}" cannot read deposits`);
+    }
+    if (origin.network !== undefined && origin.network !== key) {
+      throw new Error(`near-intents: origin adapter "${key}" is bound to ${origin.network}`);
+    }
+  }
+}
+
+/**
  * Runs the structural checks shared by both payload types.
  *
- * @param origins - Origin adapters by namespace
+ * @param origins - Origin adapters by network or namespace
  * @param payload - Payment payload
  * @param requirements - The resource server's unquoted entry
  * @returns The shared facts, or the rejection
@@ -193,7 +253,7 @@ function inspect(
       message: "paymentRequirements.extra is not a near-intents entry",
     };
   }
-  const origin = origins[requirements.network.split(":")[0]];
+  const origin = origins[requirements.network] ?? origins[requirements.network.split(":")[0]];
   if (!origin) {
     return {
       ok: false,

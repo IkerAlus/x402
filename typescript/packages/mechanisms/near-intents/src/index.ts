@@ -9,6 +9,7 @@ export {
   DEFAULT_SETTLE_WINDOW_MS,
   DEFAULT_SLIPPAGE_TOLERANCE,
   DEFAULT_TOKENS_TTL_MS,
+  MIN_GRACE_SECONDS,
   ONE_CLICK_BASE_URL,
   ONE_CLICK_BLOCKCHAINS,
   PAYMENT_FLOW,
@@ -49,6 +50,7 @@ export { failureResponse, pendingResponse, quotedEntryFrom, successResponse } fr
 // 1Click Swap API client, asset mapping, outcome mapping and dry-quote cache
 export { createOneClickClient, OneClickError, OneClickUnavailableError } from "./oneclick/client";
 export type {
+  OneClickCallOptions,
   OneClickClient,
   OneClickConfig,
   QuoteRequest,

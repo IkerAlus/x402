@@ -32,6 +32,9 @@ export type DepositReading =
  * the facilitator, `sendDeposit` the client; a deployment supplies what its role needs.
  */
 export interface OriginAdapter {
+  /** CAIP-2 network this adapter is bound to. Absent when it serves a whole namespace. */
+  readonly network?: string;
+
   /** Reverse lookup for core's USD spend caps. */
   findDefaultAsset?: FindDefaultAsset;
 

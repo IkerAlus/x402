@@ -41,8 +41,11 @@ export const ASSET_TRANSFER_METHOD = "near-intents";
 /** The only `paymentFlow` of this method. */
 export const PAYMENT_FLOW = "upfront";
 
-/** Operation-token grace after the refund deadline, in seconds. The spec requires at least 24 h. */
-export const DEFAULT_GRACE_SECONDS = 86_400;
+/** Smallest operation-token grace after the refund deadline the spec allows: 24 h. */
+export const MIN_GRACE_SECONDS = 86_400;
+
+/** Operation-token grace after the refund deadline, in seconds. */
+export const DEFAULT_GRACE_SECONDS = MIN_GRACE_SECONDS;
 
 /** Slippage tolerance range and default published in `/supported`, in basis points. */
 export const DEFAULT_SLIPPAGE_TOLERANCE = { min: 10, max: 300, default: 50 };

@@ -59,8 +59,8 @@ export interface FakeOneClick {
   /** Minted wet quotes by deposit address. */
   quotes: Map<string, FakeQuote>;
   tokens: Token[];
-  /** Answers the next `n` requests with HTTP 500. */
-  failNextRequests(n: number): void;
+  /** Answers the next `n` requests with HTTP 500, or only those on `path` when given. */
+  failNextRequests(n: number, path?: string): void;
   /** Overrides fields of the next wet quote (e.g. `depositMemo`). */
   nextQuote(overrides: Record<string, unknown>): void;
   /** Moves a quote to `status` and merges `swapDetails` overrides. */
@@ -77,10 +77,11 @@ export interface FakeOneClick {
  * @returns The fake and its inspection handles
  */
 export function createFakeOneClick(options: { tokens?: Token[] } = {}): FakeOneClick {
-  const tokens = options.tokens ?? defaultTokens;
+  const tokens = [...(options.tokens ?? defaultTokens)];
   const quotes = new Map<string, FakeQuote>();
   const requests: FakeRequest[] = [];
   let failCount = 0;
+  let failPath: string | undefined;
   let mintCounter = 0;
   let nextOverrides: Record<string, unknown> = {};
 
@@ -96,7 +97,13 @@ export function createFakeOneClick(options: { tokens?: Token[] } = {}): FakeOneC
     updatedAt: new Date(0).toISOString(),
     quoteResponse: { quoteRequest: q.quoteRequest, quote: q.quote, signature: "fake-sig" },
     swapDetails: {
-      originChainTxHashes: q.submittedTxHashes.map(hash => ({ hash })),
+      depositedAmount: null,
+      amountIn: null,
+      amountOut: null,
+      refundedAmount: "0",
+      refundReason: null,
+      originChainTxHashes:
+        q.status === "PENDING_DEPOSIT" ? [] : q.submittedTxHashes.map(hash => ({ hash })),
       destinationChainTxHashes:
         q.status === "SUCCESS" ? [{ hash: `0xdest${q.depositAddress.slice(2)}` }] : [],
       ...q.swapDetails,
@@ -104,7 +111,7 @@ export function createFakeOneClick(options: { tokens?: Token[] } = {}): FakeOneC
   });
 
   const handle = (request: FakeRequest): Response => {
-    if (failCount > 0) {
+    if (failCount > 0 && (failPath === undefined || request.path === failPath)) {
       failCount -= 1;
       return json(500, { message: "fake internal error" });
     }
@@ -163,10 +170,7 @@ export function createFakeOneClick(options: { tokens?: Token[] } = {}): FakeOneC
         return json(404, { message: "Deposit address not found" });
       }
       q.submittedTxHashes.push(body.txHash);
-      if (q.status === "PENDING_DEPOSIT") {
-        q.status = "KNOWN_DEPOSIT_TX";
-      }
-      return json(200, statusPayload(q));
+      return json(201, statusPayload(q));
     }
     if (request.method === "GET" && request.path === "/v0/status") {
       const q = quotes.get(request.query.depositAddress ?? "");
@@ -200,8 +204,9 @@ export function createFakeOneClick(options: { tokens?: Token[] } = {}): FakeOneC
     requests,
     quotes,
     tokens,
-    failNextRequests(n) {
+    failNextRequests(n, path) {
       failCount = n;
+      failPath = path;
     },
     nextQuote(overrides) {
       nextOverrides = overrides;

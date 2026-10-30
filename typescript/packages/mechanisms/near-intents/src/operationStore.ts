@@ -1,9 +1,12 @@
+import { randomUUID } from "node:crypto";
 import type { PaymentRequirements, SettleResponse } from "@x402/core/types";
 
 /**
  * Facilitator-side state of an operation, keyed by `operationKey`: an in-flight claim while
- * one settle attempt works on it, then the single recorded result. Multi-instance
- * facilitators must supply a shared implementation; `claim` must be atomic.
+ * one settle attempt works on it, then the single recorded result. A claim is owned: only
+ * the attempt holding the returned claim id can release it or record through it, and a
+ * lapsed claim records nothing. Multi-instance facilitators must supply a shared
+ * implementation whose `claim` and `record` are atomic.
  */
 export interface FacilitatorOperationStore {
   /**
@@ -20,34 +23,43 @@ export interface FacilitatorOperationStore {
    *
    * @param key - Operation key
    * @param expiresAt - Unix time in milliseconds after which the claim lapses
-   * @returns `true` when this caller now holds the claim
+   * @returns The claim id to pass to `release` and `record`, or `undefined`
    */
-  claim(key: string, expiresAt: number): Promise<boolean>;
+  claim(key: string, expiresAt: number): Promise<string | undefined>;
 
   /**
-   * Drops the claim without recording a result, so a later presentation may claim again.
+   * Drops the claim if `claimId` still holds it. A lapsed or superseded claim is left alone.
    *
    * @param key - Operation key
+   * @param claimId - Id returned by `claim`
    */
-  release(key: string): Promise<void>;
+  release(key: string, claimId: string): Promise<void>;
 
   /**
-   * Records the terminal result and drops the claim. The first record for a key wins.
+   * Records the terminal result and drops the claim, if `claimId` still holds an unexpired
+   * claim. Otherwise records nothing.
    *
    * @param key - Operation key
+   * @param claimId - Id returned by `claim`
    * @param response - Settlement response to return to every later presentation
    * @param retainUntil - Unix time in milliseconds until which the record is kept
+   * @returns `true` when the result was recorded
    */
-  record(key: string, response: SettleResponse, retainUntil: number): Promise<void>;
+  record(
+    key: string,
+    claimId: string,
+    response: SettleResponse,
+    retainUntil: number,
+  ): Promise<boolean>;
 }
 
 /**
  * Per-process {@link FacilitatorOperationStore}. Node.js is single-threaded and the
- * check-and-set in `claim` has no `await`, so it is atomic within one process. Multi-instance
- * facilitators need a shared implementation (e.g. Redis).
+ * check-and-set in `claim` and `record` has no `await`, so both are atomic within one
+ * process. Multi-instance facilitators need a shared implementation (e.g. Redis).
  */
 export class InMemoryFacilitatorOperationStore implements FacilitatorOperationStore {
-  private readonly claims = new Map<string, number>();
+  private readonly claims = new Map<string, { id: string; expiresAt: number }>();
   private readonly records = new Map<string, { response: SettleResponse; retainUntil: number }>();
 
   /**
@@ -66,38 +78,52 @@ export class InMemoryFacilitatorOperationStore implements FacilitatorOperationSt
    *
    * @param key - Operation key
    * @param expiresAt - Unix time in milliseconds after which the claim lapses
-   * @returns `true` when this caller now holds the claim
+   * @returns The claim id, or `undefined` when the operation is claimed or recorded
    */
-  async claim(key: string, expiresAt: number): Promise<boolean> {
+  async claim(key: string, expiresAt: number): Promise<string | undefined> {
     this.prune();
     if (this.records.has(key) || this.claims.has(key)) {
-      return false;
+      return undefined;
     }
-    this.claims.set(key, expiresAt);
-    return true;
+    const id = randomUUID();
+    this.claims.set(key, { id, expiresAt });
+    return id;
   }
 
   /**
-   * Drops the claim.
+   * Drops the claim if `claimId` still holds it.
    *
    * @param key - Operation key
+   * @param claimId - Id returned by `claim`
    */
-  async release(key: string): Promise<void> {
-    this.claims.delete(key);
+  async release(key: string, claimId: string): Promise<void> {
+    if (this.claims.get(key)?.id === claimId) {
+      this.claims.delete(key);
+    }
   }
 
   /**
-   * Records the terminal result and drops the claim.
+   * Records the terminal result if `claimId` still holds an unexpired claim.
    *
    * @param key - Operation key
+   * @param claimId - Id returned by `claim`
    * @param response - Settlement response
    * @param retainUntil - Unix time in milliseconds until which the record is kept
+   * @returns `true` when the result was recorded
    */
-  async record(key: string, response: SettleResponse, retainUntil: number): Promise<void> {
-    this.claims.delete(key);
-    if (!this.records.has(key)) {
-      this.records.set(key, { response, retainUntil });
+  async record(
+    key: string,
+    claimId: string,
+    response: SettleResponse,
+    retainUntil: number,
+  ): Promise<boolean> {
+    this.prune();
+    if (this.claims.get(key)?.id !== claimId) {
+      return false;
     }
+    this.claims.delete(key);
+    this.records.set(key, { response, retainUntil });
+    return true;
   }
 
   /**
@@ -105,13 +131,13 @@ export class InMemoryFacilitatorOperationStore implements FacilitatorOperationSt
    */
   private prune(): void {
     const now = Date.now();
-    for (const [key, expiresAt] of this.claims) {
-      if (expiresAt <= now) {
+    for (const [key, claim] of this.claims) {
+      if (claim.expiresAt <= now) {
         this.claims.delete(key);
       }
     }
-    for (const [key, entry] of this.records) {
-      if (entry.retainUntil <= now) {
+    for (const [key, record] of this.records) {
+      if (record.retainUntil <= now) {
         this.records.delete(key);
       }
     }

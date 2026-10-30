@@ -122,7 +122,12 @@ export function createFacilitatorFixture(
   const scheme = new ExactNearIntentsScheme({
     oneClick: createOneClickClient({ fetch: fake.fetch }),
     tokenKeys: keys,
-    origins: { eip155: createEvmOrigin({ publicClient: chain.publicClient }) },
+    origins: {
+      [ORIGIN_NETWORK]: createEvmOrigin({
+        network: ORIGIN_NETWORK,
+        publicClient: chain.publicClient,
+      }),
+    },
     settleWindowMs: 5_000,
     pollIntervalMs: 1_000,
     ...overrides,

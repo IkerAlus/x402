@@ -39,28 +39,45 @@ describe("InMemoryFacilitatorOperationStore", () => {
     expect((await Promise.all(attempts)).filter(Boolean)).toHaveLength(1);
   });
 
-  it("frees the claim on release and on expiry", async () => {
+  it("frees the claim on release by its owner and on expiry", async () => {
     const store = new InMemoryFacilitatorOperationStore();
-    expect(await store.claim(KEY, T0 + 60_000)).toBe(true);
-    expect(await store.claim(KEY, T0 + 60_000)).toBe(false);
-    await store.release(KEY);
-    expect(await store.claim(KEY, T0 + 60_000)).toBe(true);
+    const first = await store.claim(KEY, T0 + 60_000);
+    expect(first).toBeDefined();
+    expect(await store.claim(KEY, T0 + 60_000)).toBeUndefined();
+    await store.release(KEY, "someone-else");
+    expect(await store.claim(KEY, T0 + 60_000)).toBeUndefined();
+    await store.release(KEY, first!);
+    const second = await store.claim(KEY, T0 + 60_000);
+    expect(second).toBeDefined();
     vi.setSystemTime(T0 + 60_000);
-    expect(await store.claim(KEY, T0 + 120_000)).toBe(true);
+    expect(await store.claim(KEY, T0 + 120_000)).toBeDefined();
   });
 
-  it("returns the first recorded result unchanged until its retention ends", async () => {
+  it("ignores a lapsed worker: it can neither release the new claim nor record", async () => {
+    const store = new InMemoryFacilitatorOperationStore();
+    const lapsed = (await store.claim(KEY, T0 + 1_000))!;
+    vi.setSystemTime(T0 + 1_000);
+    const current = (await store.claim(KEY, T0 + 61_000))!;
+    await store.release(KEY, lapsed);
+    expect(await store.claim(KEY, T0 + 61_000)).toBeUndefined();
+    expect(await store.record(KEY, lapsed, response, T0 + DAY)).toBe(false);
+    expect(await store.get(KEY)).toBeUndefined();
+    expect(await store.record(KEY, current, response, T0 + DAY)).toBe(true);
+    expect(await store.get(KEY)).toBe(response);
+  });
+
+  it("returns the recorded result until its retention ends", async () => {
     const store = new InMemoryFacilitatorOperationStore();
     expect(await store.get(KEY)).toBeUndefined();
-    await store.claim(KEY, T0 + 60_000);
-    await store.record(KEY, response, T0 + DAY);
+    const claimId = (await store.claim(KEY, T0 + 60_000))!;
+    expect(await store.record(KEY, claimId, response, T0 + DAY)).toBe(true);
     expect(await store.get(KEY)).toBe(response);
-    expect(await store.claim(KEY, T0 + 60_000)).toBe(false);
-    await store.record(KEY, { ...response, success: false, errorReason: "late" }, T0 + DAY);
+    expect(await store.claim(KEY, T0 + 60_000)).toBeUndefined();
+    expect(await store.record(KEY, claimId, { ...response, success: false }, T0 + DAY)).toBe(false);
     expect(await store.get(KEY)).toBe(response);
     vi.setSystemTime(T0 + DAY);
     expect(await store.get(KEY)).toBeUndefined();
-    expect(await store.claim(KEY, T0 + DAY + 60_000)).toBe(true);
+    expect(await store.claim(KEY, T0 + DAY + 60_000)).toBeDefined();
   });
 });
 
